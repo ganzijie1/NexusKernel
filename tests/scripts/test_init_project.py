@@ -98,12 +98,22 @@ include = ["nexuskernel*"]
 """,
     )
     _write(
+        project / "docker/.env.example",
+        """NEXUSKERNEL_DEFAULT_PORT=8030
+NEXUSKERNEL_API_KEY=
+""",
+    )
+    _write(
         project / "docker/.env.dev.example",
         """NEXUSKERNEL_DEFAULT_PORT=8030
 NEXUSKERNEL_API_KEY=
 DATABASE_URL=${DATABASE_URL:-}
 HOST=localhost
 """,
+    )
+    _write(
+        project / "docker/other.example",
+        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
     )
     _write(
         project / "docker/README.md",
@@ -116,6 +126,14 @@ HOST=localhost
     _write(
         project / "docs/guide/nested.md",
         "NexusKernel Starter uses nexuskernel-starter and NEXUSKERNEL.\n",
+    )
+    _write(
+        project / "docs/superpowers/plans/review.md",
+        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
+    )
+    _write(
+        project / "docs/superpowers/specs/review.md",
+        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
     )
     _write(
         project / "scripts/untouched.py",
@@ -172,6 +190,25 @@ def _snapshot(project: Path) -> dict[str, tuple[bytes, int]]:
         for path in project.rglob("*")
         if path.is_file()
     }
+
+
+def _replace_in_template_files(project: Path, old: str, new: str) -> None:
+    relative_paths = (
+        "README.md",
+        "pyproject.toml",
+        "config/settings.yaml",
+        "docker/Dockerfile",
+        "docker/docker-compose-dev.yml",
+        "docker/.env.example",
+        "docker/.env.dev.example",
+        "docker/README.md",
+        ".gitlab-ci.yml",
+        "docs/guide/nested.md",
+    )
+    for relative_path in relative_paths:
+        path = project / relative_path
+        content = path.read_text(encoding="utf-8")
+        path.write_text(content.replace(old, new), encoding="utf-8", newline="")
 
 
 def _load_initializer(project: Path) -> ModuleType:
@@ -240,6 +277,7 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     pyproject = (template / "pyproject.toml").read_text(encoding="utf-8")
     config = (template / "config/settings.yaml").read_text(encoding="utf-8")
     compose = (template / "docker/docker-compose-dev.yml").read_text(encoding="utf-8")
+    generated_base_env = (template / "docker/.env").read_text(encoding="utf-8")
     generated_env = (template / "docker/.env.dev").read_text(encoding="utf-8")
     nested_doc = (template / "docs/guide/nested.md").read_text(encoding="utf-8")
     marker = json.loads(
@@ -260,6 +298,8 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     assert "${ACME_AI_PORT:-9123}:8030" in compose
     assert "${OTHER_PORT:-8030}:8030" in compose
     assert 'sample-port: "8030"' in compose
+    assert "ACME_AI_DEFAULT_PORT=9123" in generated_base_env
+    assert "ACME_AI_API_KEY=" in generated_base_env
     assert "ACME_AI_DEFAULT_PORT=9123" in generated_env
     assert "ACME_AI_API_KEY=" in generated_env
     assert "Acme Intelligence" in nested_doc
@@ -271,6 +311,103 @@ def test_valid_initialization_replaces_identity_and_generates_env(
         "env_prefix": "ACME_AI",
         "port": 9123,
     }
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        "\n",
+        "\r",
+        "\r\n",
+        "\v",
+        "\f",
+        "\x1c",
+        "\x1d",
+        "\x1e",
+        "\x85",
+        "\u2028",
+        "\u2029",
+    ],
+)
+def test_name_rejects_every_splitlines_separator(
+    template: Path, separator: str
+) -> None:
+    arguments = (
+        "--name",
+        f"Left{separator}Right",
+        *VALID_ARGUMENTS[2:],
+    )
+    before = _snapshot(template)
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode != 0
+    assert "name" in result.stderr.lower()
+    assert _snapshot(template) == before
+
+
+def test_inserted_name_is_not_reprocessed_as_an_env_prefix(template: Path) -> None:
+    arguments = (
+        "--name",
+        "NEXUSKERNEL Console",
+        "--slug",
+        "acme-console",
+        "--env-prefix",
+        "ACME",
+        "--port",
+        "9123",
+    )
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode == 0, result.stderr
+    assert "# NEXUSKERNEL Console" in (template / "README.md").read_text(
+        encoding="utf-8"
+    )
+    marker = json.loads(
+        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+    )
+    assert marker["name"] == "NEXUSKERNEL Console"
+
+
+@pytest.mark.parametrize(
+    ("token", "replacement"),
+    [
+        ("NexusKernel Starter", "Alternate Starter"),
+        ("nexuskernel-starter", "alternate-starter"),
+        ("NEXUSKERNEL", "ALTERNATE"),
+        ("8030", "8031"),
+    ],
+    ids=("display-name", "slug", "env-prefix", "port"),
+)
+def test_missing_default_token_is_rejected_before_writes(
+    template: Path, token: str, replacement: str
+) -> None:
+    _replace_in_template_files(template, token, replacement)
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert "template" in result.stderr.lower()
+    assert _snapshot(template) == before
+    assert not (template / ".nexuskernel-initialized").exists()
+
+
+@pytest.mark.parametrize("port", [1, 65535])
+def test_port_boundaries_initialize_successfully(template: Path, port: int) -> None:
+    arguments = (*VALID_ARGUMENTS[:-1], str(port))
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode == 0, result.stderr
+    marker = json.loads(
+        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+    )
+    assert marker["port"] == port
+    assert f"  port: {port}" in (template / "config/settings.yaml").read_text(
+        encoding="utf-8"
+    )
 
 
 @pytest.mark.parametrize(
@@ -346,14 +483,17 @@ def test_second_execution_is_rejected_without_changes(template: Path) -> None:
     assert _snapshot(template) == before
 
 
-def test_existing_real_env_is_rejected_without_any_write(template: Path) -> None:
-    _write(template / "docker/.env.dev", "EXISTING=value\n")
+@pytest.mark.parametrize("real_env", ["docker/.env", "docker/.env.dev"])
+def test_existing_real_env_is_rejected_without_any_write(
+    template: Path, real_env: str
+) -> None:
+    _write(template / real_env, "EXISTING=value\n")
     before = _snapshot(template)
 
     result = _run_initializer(template)
 
     assert result.returncode != 0
-    assert "docker/.env.dev" in result.stderr.replace("\\", "/")
+    assert real_env in result.stderr.replace("\\", "/")
     assert _snapshot(template) == before
     assert not (template / ".nexuskernel-initialized").exists()
 
@@ -385,6 +525,7 @@ def test_replace_failure_restores_files_env_and_marker(
         module.initialize_project(template, identity)
 
     assert _snapshot(template) == before
+    assert not (template / "docker/.env").exists()
     assert not (template / "docker/.env.dev").exists()
     assert not (template / ".nexuskernel-initialized").exists()
     assert not list(template.rglob("*.tmp"))
@@ -415,6 +556,9 @@ def test_non_whitelisted_files_are_never_modified(template: Path) -> None:
             template / "scripts/untouched.py",
             template / "tests/untouched.md",
             template / "outside-whitelist.txt",
+            template / "docker/other.example",
+            template / "docs/superpowers/plans/review.md",
+            template / "docs/superpowers/specs/review.md",
         )
     }
 

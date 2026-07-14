@@ -28,26 +28,15 @@ _DEFAULT_SLUG_RE = re.compile(rf"(?<![a-z0-9-]){re.escape(DEFAULT_SLUG)}(?![a-z0
 _DEFAULT_ENV_PREFIX_RE = re.compile(
     rf"(?<![A-Z0-9_]){re.escape(DEFAULT_ENV_PREFIX)}(?=_|[^A-Z0-9_]|$)"
 )
-_DEFAULT_PORT_ASSIGNMENT_RE = re.compile(
-    rf"(?P<prefix>(?<![A-Z0-9_]){DEFAULT_ENV_PREFIX}_DEFAULT_PORT[ \t]*=[ \t]*)"
-    rf"{DEFAULT_PORT}(?![0-9])"
+_ENV_EXAMPLE_RE = re.compile(r"^\.env(?:\.[A-Za-z0-9_-]+)?\.example$")
+
+_DISPLAY_NAME_TOKEN = "display name"
+_SLUG_TOKEN = "slug"
+_ENV_PREFIX_TOKEN = "env prefix"
+_PORT_TOKEN = "port"
+_REQUIRED_TEMPLATE_TOKENS = frozenset(
+    {_DISPLAY_NAME_TOKEN, _SLUG_TOKEN, _ENV_PREFIX_TOKEN, _PORT_TOKEN}
 )
-_DEFAULT_PORT_YAML_KEY_RE = re.compile(
-    rf"(?m)(?P<prefix>^[ \t]*{DEFAULT_ENV_PREFIX}_DEFAULT_PORT[ \t]*:[ \t]*[\"']?)"
-    rf"{DEFAULT_PORT}(?P<suffix>[\"']?)(?![0-9])"
-)
-_PORT_YAML_RE = re.compile(
-    rf"(?m)(?P<prefix>^[ \t]*port[ \t]*:[ \t]*[\"']?){DEFAULT_PORT}"
-    r"(?P<suffix>[\"']?[ \t]*(?:#.*)?\r?$)"
-)
-_COMPOSE_DEFAULT_PORT_RE = re.compile(
-    r"(?P<prefix>\$\{"
-    + re.escape(DEFAULT_ENV_PREFIX)
-    + r"_PORT:-)"
-    + re.escape(DEFAULT_PORT)
-    + r"(?P<suffix>\})"
-)
-_ENV_EXAMPLE_RE = re.compile(r"^\.env\.[A-Za-z0-9_-]+\.example$")
 
 
 class InitializationError(RuntimeError):
@@ -79,7 +68,7 @@ def _validate_identity(identity: ProjectIdentity) -> ProjectIdentity:
     name = identity.name.strip()
     if not name:
         _fail("name must not be empty")
-    if "\n" in name or "\r" in name:
+    if identity.name.splitlines() != [identity.name]:
         _fail("name must be a single line")
     if len(name) > MAX_NAME_LENGTH:
         _fail(f"name must be at most {MAX_NAME_LENGTH} characters")
@@ -167,12 +156,21 @@ def _discover_whitelist(root: Path) -> list[Path]:
                     docker / "Dockerfile",
                     docker / "README.md",
                     *docker.glob("docker-compose-*.yml"),
-                    *docker.glob("*.example"),
+                    *(
+                        path
+                        for path in docker.glob("*.example")
+                        if _ENV_EXAMPLE_RE.fullmatch(path.name)
+                    ),
                 ]
             )
 
     candidates.append(root / ".gitlab-ci.yml")
-    candidates.extend(_matching_files(root, "docs", {".md"}))
+    superpowers_docs = root / "docs/superpowers"
+    candidates.extend(
+        path
+        for path in _matching_files(root, "docs", {".md"})
+        if not path.is_relative_to(superpowers_docs)
+    )
 
     safe_candidates: dict[str, Path] = {}
     for path in candidates:
@@ -181,41 +179,83 @@ def _discover_whitelist(root: Path) -> list[Path]:
     return [safe_candidates[key] for key in sorted(safe_candidates)]
 
 
-def _replace_port(text: str, relative_path: str, port: int) -> str:
-    replacement = str(port)
-    text = _DEFAULT_PORT_ASSIGNMENT_RE.sub(
-        lambda match: f"{match.group('prefix')}{replacement}", text
-    )
-    text = _DEFAULT_PORT_YAML_KEY_RE.sub(
-        lambda match: f"{match.group('prefix')}{replacement}{match.group('suffix')}",
-        text,
-    )
-
-    if relative_path.endswith((".yaml", ".yml")):
-        text = _PORT_YAML_RE.sub(
-            lambda match: (
-                f"{match.group('prefix')}{replacement}{match.group('suffix')}"
-            ),
-            text,
-        )
+def _replacement_pattern(relative_path: str) -> re.Pattern[str]:
+    alternatives = [
+        (
+            rf"(?P<port_assignment>(?<![A-Z0-9_]){DEFAULT_ENV_PREFIX}"
+            rf"(?P<assignment_middle>_DEFAULT_PORT[ \t]*=[ \t]*)"
+            rf"{DEFAULT_PORT}(?![0-9]))"
+        ),
+        (
+            rf"(?P<port_yaml_key>^(?P<yaml_key_indent>[ \t]*){DEFAULT_ENV_PREFIX}"
+            rf"(?P<yaml_key_middle>_DEFAULT_PORT[ \t]*:[ \t]*)"
+            rf"(?P<yaml_key_open_quote>[\"']?){DEFAULT_PORT}"
+            r"(?P<yaml_key_close_quote>[\"']?)(?![0-9]))"
+        ),
+    ]
     if relative_path.startswith("docker/docker-compose-") and relative_path.endswith(
         ".yml"
     ):
-        text = _COMPOSE_DEFAULT_PORT_RE.sub(
-            lambda match: (
-                f"{match.group('prefix')}{replacement}{match.group('suffix')}"
-            ),
-            text,
+        alternatives.append(
+            rf"(?P<compose_port>\$\{{{DEFAULT_ENV_PREFIX}_PORT:-{DEFAULT_PORT}\}})"
         )
-    return text
+    if relative_path.endswith((".yaml", ".yml")):
+        alternatives.append(
+            (
+                rf"(?P<yaml_port>^(?P<yaml_port_prefix>[ \t]*port[ \t]*:[ \t]*)"
+                rf"(?P<yaml_port_open_quote>[\"']?){DEFAULT_PORT}"
+                r"(?P<yaml_port_close_quote>[\"']?)"
+                r"(?P<yaml_port_suffix>[ \t]*(?:#.*)?\r?$))"
+            )
+        )
+    alternatives.extend(
+        [
+            rf"(?P<display_name>{_DEFAULT_NAME_RE.pattern})",
+            rf"(?P<slug>{_DEFAULT_SLUG_RE.pattern})",
+            rf"(?P<env_prefix>{_DEFAULT_ENV_PREFIX_RE.pattern})",
+        ]
+    )
+    return re.compile("|".join(alternatives), flags=re.MULTILINE)
 
 
-def _transform_text(text: str, relative_path: str, identity: ProjectIdentity) -> str:
-    transformed = _replace_port(text, relative_path, identity.port)
-    transformed = _DEFAULT_NAME_RE.sub(identity.name, transformed)
-    transformed = _DEFAULT_SLUG_RE.sub(identity.slug, transformed)
-    transformed = _DEFAULT_ENV_PREFIX_RE.sub(identity.env_prefix, transformed)
-    return transformed
+def _transform_text(
+    text: str, relative_path: str, identity: ProjectIdentity
+) -> tuple[str, frozenset[str]]:
+    hits: set[str] = set()
+    port = str(identity.port)
+
+    def replace(match: re.Match[str]) -> str:
+        if match.group("port_assignment") is not None:
+            hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
+            return f"{identity.env_prefix}{match.group('assignment_middle')}{port}"
+        if match.group("port_yaml_key") is not None:
+            hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
+            return (
+                f"{match.group('yaml_key_indent')}{identity.env_prefix}"
+                f"{match.group('yaml_key_middle')}{match.group('yaml_key_open_quote')}"
+                f"{port}{match.group('yaml_key_close_quote')}"
+            )
+        if "compose_port" in match.re.groupindex and match.group("compose_port"):
+            hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
+            return f"${{{identity.env_prefix}_PORT:-{port}}}"
+        if "yaml_port" in match.re.groupindex and match.group("yaml_port"):
+            hits.add(_PORT_TOKEN)
+            return (
+                f"{match.group('yaml_port_prefix')}{match.group('yaml_port_open_quote')}"
+                f"{port}{match.group('yaml_port_close_quote')}"
+                f"{match.group('yaml_port_suffix')}"
+            )
+        if match.group("display_name") is not None:
+            hits.add(_DISPLAY_NAME_TOKEN)
+            return identity.name
+        if match.group("slug") is not None:
+            hits.add(_SLUG_TOKEN)
+            return identity.slug
+        hits.add(_ENV_PREFIX_TOKEN)
+        return identity.env_prefix
+
+    transformed = _replacement_pattern(relative_path).sub(replace, text)
+    return transformed, frozenset(hits)
 
 
 def _decode_candidate(
@@ -243,6 +283,7 @@ def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
     files = _discover_whitelist(root)
     originals: dict[Path, tuple[bytes, int]] = {}
     transformed: dict[Path, bytes] = {}
+    template_tokens: set[str] = set()
 
     for path in files:
         content = path.read_bytes()
@@ -257,9 +298,18 @@ def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
         )
         if text is None:
             continue
-        transformed[path] = _transform_text(
+        transformed_text, hits = _transform_text(
             text, _relative_display(root, path), identity
-        ).encode("utf-8")
+        )
+        template_tokens.update(hits)
+        transformed[path] = transformed_text.encode("utf-8")
+
+    missing_tokens = _REQUIRED_TEMPLATE_TOKENS - template_tokens
+    if missing_tokens:
+        _fail(
+            "template is missing required default token(s): "
+            + ", ".join(sorted(missing_tokens))
+        )
 
     generated: list[tuple[Path, bytes, int]] = []
     for example in files:
