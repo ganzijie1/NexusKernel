@@ -79,6 +79,21 @@ python_minor_version() {
     "$1" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
 }
 
+validate_venv() {
+    local interpreter="$1"
+    local expected_environment="$2"
+
+    "$interpreter" -c '
+import sys
+from pathlib import Path
+
+expected = Path(sys.argv[1]).resolve()
+prefix = Path(sys.prefix).resolve()
+base_prefix = Path(sys.base_prefix).resolve()
+raise SystemExit(0 if prefix == expected and base_prefix != prefix else 1)
+' "$expected_environment"
+}
+
 safe_remove_environment() {
     local target="$1"
     local target_parent
@@ -108,6 +123,8 @@ if [[ -e "$environment_dir" ]]; then
         safe_remove_environment "$environment_dir"
     else
         [[ -f "$environment_python" ]] \
+            || fail "existing environment is invalid; rerun with --recreate"
+        validate_venv "$environment_python" "$environment_dir" \
             || fail "existing environment is invalid; rerun with --recreate"
         environment_version="$(python_minor_version "$environment_python")" \
             || fail "existing environment is invalid; rerun with --recreate"

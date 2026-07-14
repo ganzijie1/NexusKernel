@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+from pathspec import GitIgnoreSpec
+
 
 ROOT = Path(__file__).resolve().parents[2]
-BASH = Path(r"D:\Program Files\Git\bin\bash.exe")
 
 CORE_DEPENDENCIES = [
     "fastapi==0.139.0",
@@ -38,6 +43,25 @@ OPTIONAL_DEPENDENCIES = {
 }
 
 
+def _find_bash() -> str:
+    if os.name == "nt":
+        candidates = [Path(ROOT.anchor) / "Program Files/Git/bin/bash.exe"]
+        for variable in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+            if value := os.environ.get(variable):
+                candidates.append(Path(value) / "Git/bin/bash.exe")
+        if local_app_data := os.environ.get("LOCALAPPDATA"):
+            candidates.append(Path(local_app_data) / "Programs/Git/bin/bash.exe")
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+
+    if discovered := shutil.which("bash"):
+        return discovered
+
+    pytest.skip("Bash is required to verify scripts/setup_python_env.sh")
+
+
 def _required_file(relative_path: str) -> Path:
     path = ROOT / relative_path
     assert path.is_file(), f"missing required project file: {relative_path}"
@@ -62,6 +86,13 @@ def _git_ignores(relative_path: str) -> bool:
     )
     assert result.returncode in {0, 1}, result.stderr
     return result.returncode == 0
+
+
+def test_tooling_tests_resolve_bash_at_runtime() -> None:
+    source = Path(__file__).read_text(encoding="utf-8")
+    hardcoded_assignment = "BASH " + "= Path("
+
+    assert hardcoded_assignment not in source
 
 
 def test_pyproject_defines_build_and_core_project_contract() -> None:
@@ -103,6 +134,7 @@ def test_import_package_roots_exist() -> None:
 def test_setup_script_has_strict_python_311_environment_contract() -> None:
     script_path = _required_file("scripts/setup_python_env.sh")
     script = script_path.read_text(encoding="utf-8")
+    bash = _find_bash()
 
     assert "set -euo pipefail" in script
     assert all(option in script for option in ("--python", "--recreate", "--help"))
@@ -114,10 +146,13 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
     assert "rm -rf --" in script
     assert "$project_root/.venv-win" in script
     assert "$project_root/.venv-linux" in script
+    assert "validate_venv" in script
+    assert "sys.prefix" in script
+    assert "sys.base_prefix" in script
     assert re.search(r"(?<![\w-])\.venv(?![\w-])", script) is None
 
     syntax = subprocess.run(
-        [str(BASH), "-n", "scripts/setup_python_env.sh"],
+        [bash, "-n", "scripts/setup_python_env.sh"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -126,7 +161,7 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
     assert syntax.returncode == 0, syntax.stderr
 
     help_result = subprocess.run(
-        [str(BASH), "scripts/setup_python_env.sh", "--help"],
+        [bash, "scripts/setup_python_env.sh", "--help"],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -134,6 +169,38 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
     )
     assert help_result.returncode == 0, help_result.stderr
     assert all(option in help_result.stdout for option in ("--python", "--recreate", "--help"))
+
+
+def test_setup_script_rejects_interpreter_from_a_different_venv(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    script_dir = project_root / "scripts"
+    script_dir.mkdir(parents=True)
+    shutil.copy2(_required_file("scripts/setup_python_env.sh"), script_dir)
+
+    if os.name == "nt":
+        environment_python = project_root / ".venv-win/Scripts/python.exe"
+    else:
+        environment_python = project_root / ".venv-linux/bin/python"
+    environment_python.parent.mkdir(parents=True)
+    environment_python.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [[ "${1:-}" == "-m" ]]; then exit 86; fi\n'
+        f'exec "{Path(sys.executable).as_posix()}" "$@"\n',
+        encoding="utf-8",
+    )
+    environment_python.chmod(0o755)
+
+    result = subprocess.run(
+        [_find_bash(), "scripts/setup_python_env.sh"],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert result.returncode != 86, "script reached pip instead of rejecting the reused interpreter"
+    assert "--recreate" in result.stderr
 
 
 def test_gitignore_excludes_generated_and_secret_files_but_allows_examples() -> None:
@@ -175,6 +242,23 @@ def test_dockerignore_excludes_repository_only_and_sensitive_paths() -> None:
         ".env.*",
         "!*.example",
     } <= rules
+
+
+def test_dockerignore_recursively_excludes_env_files_but_keeps_examples() -> None:
+    dockerignore = _required_file(".dockerignore")
+    rules = dockerignore.read_text(encoding="utf-8").splitlines()
+
+    assert {"**/.env", "**/.env.*", "!**/*.example"} <= set(rules)
+
+    spec = GitIgnoreSpec.from_lines(rules)
+    ignored = [".env", ".env.prod", "docker/.env", "deploy/prod/.env.secret"]
+    allowed = [
+        ".env.example",
+        "docker/.env.prod.example",
+        "deploy/prod/.env.secret.example",
+    ]
+    assert all(spec.match_file(path) for path in ignored)
+    assert all(not spec.match_file(path) for path in allowed)
 
 
 def test_gitattributes_normalizes_cross_platform_line_endings() -> None:
