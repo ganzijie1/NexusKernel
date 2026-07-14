@@ -17,10 +17,12 @@ DEFAULT_SLUG = "nexuskernel-starter"
 DEFAULT_ENV_PREFIX = "NEXUSKERNEL"
 DEFAULT_PORT = "8030"
 MARKER_NAME = ".nexuskernel-initialized"
-MAX_NAME_LENGTH = 100
+LOCK_NAME = ".nexuskernel-init.lock"
+MAX_NAME_LENGTH = 80
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ENV_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+_DISPLAY_NAME_RE = re.compile(r"^[\w .()\-]+$")
 _DEFAULT_NAME_RE = re.compile(
     rf"(?<![A-Za-z0-9_]){re.escape(DEFAULT_NAME)}(?![A-Za-z0-9_])"
 )
@@ -72,6 +74,13 @@ def _validate_identity(identity: ProjectIdentity) -> ProjectIdentity:
         _fail("name must be a single line")
     if len(name) > MAX_NAME_LENGTH:
         _fail(f"name must be at most {MAX_NAME_LENGTH} characters")
+    if not _DISPLAY_NAME_RE.fullmatch(name) or name in {"---", "..."}:
+        _fail(
+            "name may contain only Unicode letters, digits, underscores, spaces, "
+            "dots, parentheses, and hyphens"
+        )
+    if name.startswith("- "):
+        _fail("name must be safe as a plain configuration value")
     if not _SLUG_RE.fullmatch(identity.slug):
         _fail(
             "slug must contain only lowercase letters and digits separated by "
@@ -329,7 +338,7 @@ def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
                 "environment example must be UTF-8 text: "
                 f"{_relative_display(root, example)}"
             )
-        generated.append((real_env, example_content, originals[example][1]))
+        generated.append((real_env, example_content, 0o600))
 
     writes = [
         _PlannedWrite(
@@ -372,7 +381,7 @@ def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
         _PlannedWrite(
             target=root / MARKER_NAME,
             content=marker_content,
-            mode=0o644,
+            mode=0o600,
             original_content=None,
             original_mode=None,
         )
@@ -408,18 +417,42 @@ def _restore_write(write: _PlannedWrite) -> None:
         os.chmod(write.target, write.original_mode)
 
 
+def _same_file(left: Path, right: Path) -> bool:
+    try:
+        return left.samefile(right)
+    except OSError:
+        return False
+
+
 def _commit_writes(writes: list[_PlannedWrite]) -> None:
     staged: dict[Path, Path] = {}
-    replaced: list[_PlannedWrite] = []
+    committed: list[_PlannedWrite] = []
     try:
         for write in writes:
             staged[write.target] = _stage_write(write)
         for write in writes:
-            replaced.append(write)
-            os.replace(staged[write.target], write.target)
+            temp_path = staged[write.target]
+            if write.original_content is None:
+                try:
+                    os.link(temp_path, write.target)
+                except BaseException:
+                    if _same_file(temp_path, write.target):
+                        committed.append(write)
+                    raise
+                committed.append(write)
+                temp_path.unlink()
+                continue
+
+            try:
+                os.replace(temp_path, write.target)
+            except BaseException:
+                if not temp_path.exists():
+                    committed.append(write)
+                raise
+            committed.append(write)
     except BaseException as error:
         rollback_errors: list[OSError] = []
-        for write in reversed(replaced):
+        for write in reversed(committed):
             try:
                 _restore_write(write)
             except OSError as rollback_error:
@@ -434,21 +467,46 @@ def _commit_writes(writes: list[_PlannedWrite]) -> None:
             temp_path.unlink(missing_ok=True)
 
 
+def _acquire_lock(root: Path) -> Path:
+    lock = root / LOCK_NAME
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise InitializationError(
+            f"project initialization lock exists: {LOCK_NAME}"
+        ) from error
+
+    try:
+        os.write(descriptor, f"{os.getpid()}\n".encode("ascii"))
+        os.fsync(descriptor)
+    except BaseException:
+        os.close(descriptor)
+        lock.unlink(missing_ok=True)
+        raise
+    os.close(descriptor)
+    return lock
+
+
 def initialize_project(root: Path, identity: ProjectIdentity) -> None:
     """Initialize a template copy in place with atomic rollback on failure."""
     root = root.resolve(strict=True)
-    marker = root / MARKER_NAME
-    if _path_exists(marker):
-        _fail(f"project is already initialized: {MARKER_NAME}")
+    lock = _acquire_lock(root)
+    try:
+        marker = root / MARKER_NAME
+        if _path_exists(marker):
+            _fail(f"project is already initialized: {MARKER_NAME}")
 
-    validated = _validate_identity(identity)
-    writes = _plan_writes(root, validated)
-    _commit_writes(writes)
+        validated = _validate_identity(identity)
+        writes = _plan_writes(root, validated)
+        _commit_writes(writes)
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Initialize this NexusKernel Starter repository once."
+        description="Initialize this NexusKernel Starter repository once.",
+        allow_abbrev=False,
     )
     parser.add_argument("--name", required=True, help="project display name")
     parser.add_argument("--slug", required=True, help="Python distribution slug")

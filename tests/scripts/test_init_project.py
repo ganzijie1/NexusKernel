@@ -371,6 +371,50 @@ def test_inserted_name_is_not_reprocessed_as_an_env_prefix(template: Path) -> No
 
 
 @pytest.mark.parametrize(
+    "name",
+    ["Acme Service-2.0 (Core)", "龙芯 服务_2.0"],
+)
+def test_safe_english_and_chinese_names_initialize(template: Path, name: str) -> None:
+    arguments = ("--name", f"  {name}  ", *VALID_ARGUMENTS[2:])
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode == 0, result.stderr
+    marker = json.loads(
+        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+    )
+    assert marker["name"] == name
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Acme: Service",
+        "Acme # Service",
+        'Acme "Service"',
+        "Acme 'Service'",
+        "Acme \\ Service",
+        "Acme [Service]",
+        "Acme {Service}",
+        "Acme = Service",
+        "Acme, Service",
+        "x" * 81,
+    ],
+)
+def test_unsafe_or_overlong_names_are_rejected_without_writes(
+    template: Path, name: str
+) -> None:
+    arguments = ("--name", name, *VALID_ARGUMENTS[2:])
+    before = _snapshot(template)
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode != 0
+    assert "name" in result.stderr.lower()
+    assert _snapshot(template) == before
+
+
+@pytest.mark.parametrize(
     ("token", "replacement"),
     [
         ("NexusKernel Starter", "Alternate Starter"),
@@ -445,6 +489,29 @@ def test_invalid_values_are_rejected_without_writes(
     assert _snapshot(template) == before
 
 
+@pytest.mark.parametrize(
+    ("full_option", "abbreviated_option"),
+    [
+        ("--name", "--na"),
+        ("--slug", "--slu"),
+        ("--env-prefix", "--env-p"),
+        ("--port", "--po"),
+    ],
+)
+def test_abbreviated_options_are_rejected_without_writes(
+    template: Path, full_option: str, abbreviated_option: str
+) -> None:
+    arguments = tuple(
+        abbreviated_option if item == full_option else item for item in VALID_ARGUMENTS
+    )
+    before = _snapshot(template)
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode != 0
+    assert _snapshot(template) == before
+
+
 @pytest.mark.parametrize("missing", ["README.md", "pyproject.toml"])
 def test_missing_required_root_file_is_rejected_without_writes(
     template: Path, missing: str
@@ -483,6 +550,64 @@ def test_second_execution_is_rejected_without_changes(template: Path) -> None:
     assert _snapshot(template) == before
 
 
+def test_existing_lock_is_preserved_and_rejected_without_writes(template: Path) -> None:
+    lock = template / ".nexuskernel-init.lock"
+    lock.write_text("external-owner\n", encoding="utf-8")
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert "lock" in result.stderr.lower()
+    assert _snapshot(template) == before
+    assert lock.read_text(encoding="utf-8") == "external-owner\n"
+
+
+def test_lock_contains_pid_uses_private_mode_and_is_removed(
+    template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_initializer(template)
+    real_open = os.open
+    real_plan = module._plan_writes
+    observed: dict[str, object] = {}
+
+    def tracking_open(
+        path: str | os.PathLike[str],
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        if Path(path).name == ".nexuskernel-init.lock":
+            observed["flags"] = flags
+            observed["mode"] = mode
+        if dir_fd is None:
+            return real_open(path, flags, mode)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def inspect_plan(root: Path, identity: object) -> object:
+        lock = root / ".nexuskernel-init.lock"
+        observed["pid"] = lock.read_text(encoding="ascii").strip()
+        return real_plan(root, identity)
+
+    monkeypatch.setattr(module.os, "open", tracking_open)
+    monkeypatch.setattr(module, "_plan_writes", inspect_plan)
+    identity = module.ProjectIdentity(
+        name="Acme Intelligence",
+        slug="acme-intelligence",
+        env_prefix="ACME_AI",
+        port=9123,
+    )
+
+    module.initialize_project(template, identity)
+
+    assert observed["flags"] & os.O_CREAT
+    assert observed["flags"] & os.O_EXCL
+    assert observed["mode"] == 0o600
+    assert observed["pid"] == str(os.getpid())
+    assert not (template / ".nexuskernel-init.lock").exists()
+
+
 @pytest.mark.parametrize("real_env", ["docker/.env", "docker/.env.dev"])
 def test_existing_real_env_is_rejected_without_any_write(
     template: Path, real_env: str
@@ -498,6 +623,84 @@ def test_existing_real_env_is_rejected_without_any_write(
     assert not (template / ".nexuskernel-initialized").exists()
 
 
+@pytest.mark.parametrize(
+    ("race_target", "external_content"),
+    [
+        ("docker/.env", "EXTERNAL_ENV=value\n"),
+        (".nexuskernel-initialized", "external marker\n"),
+    ],
+)
+def test_generated_target_race_preserves_external_target_and_rolls_back(
+    template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race_target: str,
+    external_content: str,
+) -> None:
+    module = _load_initializer(template)
+    before = _snapshot(template)
+    real_link = os.link
+    target = template / race_target
+
+    def racing_link(
+        source: str | os.PathLike[str],
+        destination: str | os.PathLike[str],
+    ) -> None:
+        if Path(destination) == target:
+            target.write_bytes(external_content.encode())
+        real_link(source, destination)
+
+    monkeypatch.setattr(module.os, "link", racing_link)
+    identity = module.ProjectIdentity(
+        name="Acme Intelligence",
+        slug="acme-intelligence",
+        env_prefix="ACME_AI",
+        port=9123,
+    )
+
+    with pytest.raises(FileExistsError):
+        module.initialize_project(template, identity)
+
+    after = _snapshot(template)
+    assert after.pop(race_target)[0] == external_content.encode()
+    assert after == before
+    assert not (template / ".nexuskernel-init.lock").exists()
+
+
+def test_replace_failure_before_call_does_not_restore_attempted_target(
+    template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_initializer(template)
+    readme = template / "README.md"
+    fixed_timestamp = 946684800_000_000_000
+    os.utime(readme, ns=(fixed_timestamp, fixed_timestamp))
+    before_content = readme.read_bytes()
+    before_mode = stat.S_IMODE(readme.stat().st_mode)
+    real_replace = os.replace
+
+    def fail_before_replace(
+        source: str | os.PathLike[str], target: str | os.PathLike[str]
+    ) -> None:
+        if Path(target) == readme:
+            raise OSError("injected pre-replace failure")
+        real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", fail_before_replace)
+    identity = module.ProjectIdentity(
+        name="Acme Intelligence",
+        slug="acme-intelligence",
+        env_prefix="ACME_AI",
+        port=9123,
+    )
+
+    with pytest.raises(OSError, match="injected pre-replace failure"):
+        module.initialize_project(template, identity)
+
+    assert readme.read_bytes() == before_content
+    assert stat.S_IMODE(readme.stat().st_mode) == before_mode
+    assert readme.stat().st_mtime_ns == fixed_timestamp
+    assert not (template / ".nexuskernel-init.lock").exists()
+
+
 def test_replace_failure_restores_files_env_and_marker(
     template: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -508,7 +711,7 @@ def test_replace_failure_restores_files_env_and_marker(
     def fail_marker_replace(
         source: str | os.PathLike[str], target: str | os.PathLike[str]
     ) -> None:
-        if Path(target).name == ".nexuskernel-initialized":
+        if Path(target).name == "README.md":
             real_replace(source, target)
             raise OSError("injected marker replace failure")
         real_replace(source, target)
@@ -529,6 +732,7 @@ def test_replace_failure_restores_files_env_and_marker(
     assert not (template / "docker/.env.dev").exists()
     assert not (template / ".nexuskernel-initialized").exists()
     assert not list(template.rglob("*.tmp"))
+    assert not (template / ".nexuskernel-init.lock").exists()
 
 
 def test_modified_file_modes_are_preserved(template: Path) -> None:
@@ -547,6 +751,27 @@ def test_modified_file_modes_are_preserved(template: Path) -> None:
     assert {
         path: stat.S_IMODE(path.stat().st_mode) for path in original_modes
     } == original_modes
+
+
+def test_generated_env_and_marker_are_planned_with_private_modes(
+    template: Path,
+) -> None:
+    module = _load_initializer(template)
+    identity = module.ProjectIdentity(
+        name="Acme Intelligence",
+        slug="acme-intelligence",
+        env_prefix="ACME_AI",
+        port=9123,
+    )
+
+    writes = module._plan_writes(template, identity)
+    modes = {
+        write.target.relative_to(template).as_posix(): write.mode for write in writes
+    }
+
+    assert modes["docker/.env"] == 0o600
+    assert modes["docker/.env.dev"] == 0o600
+    assert modes[".nexuskernel-initialized"] == 0o600
 
 
 def test_non_whitelisted_files_are_never_modified(template: Path) -> None:
