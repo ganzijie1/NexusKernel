@@ -39,6 +39,7 @@ OPTIONAL_DEPENDENCIES = {
         "pytest-asyncio==1.4.0",
         "ruff==0.15.21",
         "mypy==2.2.0",
+        "pathspec==1.1.1",
     ],
 }
 
@@ -75,7 +76,11 @@ def _load_pyproject() -> dict[str, object]:
 
 def _meaningful_lines(relative_path: str) -> set[str]:
     lines = _required_file(relative_path).read_text(encoding="utf-8").splitlines()
-    return {line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")}
+    return {
+        line.strip()
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    }
 
 
 def _git_ignores(relative_path: str) -> bool:
@@ -86,6 +91,124 @@ def _git_ignores(relative_path: str) -> bool:
     )
     assert result.returncode in {0, 1}, result.stderr
     return result.returncode == 0
+
+
+def _write_minimal_bootstrap_project(project_root: Path) -> None:
+    script_dir = project_root / "scripts"
+    package_dir = project_root / "sample"
+    script_dir.mkdir(parents=True)
+    package_dir.mkdir()
+    shutil.copy2(_required_file("scripts/setup_python_env.sh"), script_dir)
+    (package_dir / "__init__.py").write_text("", encoding="utf-8")
+    (project_root / "bootstrap_backend.py").write_text(
+        """from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    project_root = Path(__file__).resolve().parent
+    wheel_name = "bootstrap_test_project-0.0.0-py3-none-any.whl"
+    dist_info = "bootstrap_test_project-0.0.0.dist-info"
+    newline = chr(10)
+    wheel = newline.join(
+        [
+            "Wheel-Version: 1.0",
+            "Generator: bootstrap-test-backend",
+            "Root-Is-Purelib: true",
+            "Tag: py3-none-any",
+            "",
+            "",
+        ]
+    )
+    metadata = newline.join(
+        [
+            "Metadata-Version: 2.1",
+            "Name: bootstrap-test-project",
+            "Version: 0.0.0",
+            "Provides-Extra: ai",
+            "Provides-Extra: dev",
+            "",
+            "",
+        ]
+    )
+    entries = [
+        "bootstrap_test_project.pth",
+        f"{dist_info}/WHEEL",
+        f"{dist_info}/METADATA",
+        f"{dist_info}/RECORD",
+    ]
+    record = newline.join(f"{entry},," for entry in entries) + newline
+    with ZipFile(Path(wheel_directory) / wheel_name, "w", ZIP_DEFLATED) as archive:
+        archive.writestr(entries[0], f"{project_root}{newline}")
+        archive.writestr(entries[1], wheel)
+        archive.writestr(entries[2], metadata)
+        archive.writestr(entries[3], record)
+    return wheel_name
+""",
+        encoding="utf-8",
+    )
+    (project_root / "pyproject.toml").write_text(
+        """[build-system]
+requires = []
+build-backend = "bootstrap_backend"
+backend-path = ["."]
+
+[project]
+name = "bootstrap-test-project"
+version = "0.0.0"
+requires-python = ">=3.11,<3.12"
+
+[project.optional-dependencies]
+ai = []
+dev = []
+
+[tool.setuptools.packages.find]
+include = ["sample*"]
+""",
+        encoding="utf-8",
+    )
+
+
+def _run_setup(project_root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INDEX": "1",
+        }
+    )
+    return subprocess.run(
+        [
+            _find_bash(),
+            "scripts/setup_python_env.sh",
+            "--python",
+            sys.executable,
+            *arguments,
+        ],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+
+def _environment_layouts(project_root: Path) -> tuple[Path, Path, Path]:
+    if os.name == "nt":
+        environment_dir = project_root / ".venv-win"
+        return (
+            environment_dir,
+            environment_dir / "Scripts/python.exe",
+            environment_dir / "bin/python",
+        )
+
+    environment_dir = project_root / ".venv-linux"
+    return (
+        environment_dir,
+        environment_dir / "bin/python",
+        environment_dir / "Scripts/python.exe",
+    )
 
 
 def test_tooling_tests_resolve_bash_at_runtime() -> None:
@@ -100,7 +223,9 @@ def test_pyproject_defines_build_and_core_project_contract() -> None:
 
     build_system = config["build-system"]
     assert build_system["build-backend"] == "setuptools.build_meta"
-    assert any(requirement.startswith("setuptools") for requirement in build_system["requires"])
+    assert any(
+        requirement.startswith("setuptools") for requirement in build_system["requires"]
+    )
 
     project = config["project"]
     assert project["name"] == "nexuskernel-starter"
@@ -138,7 +263,9 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
 
     assert "set -euo pipefail" in script
     assert all(option in script for option in ("--python", "--recreate", "--help"))
-    assert all(platform in script for platform in ("MINGW*", "MSYS*", "CYGWIN*", "Linux*"))
+    assert all(
+        platform in script for platform in ("MINGW*", "MSYS*", "CYGWIN*", "Linux*")
+    )
     assert all(environment in script for environment in (".venv-win", ".venv-linux"))
     assert "3.11" in script
     assert "pip install --upgrade pip" in script
@@ -168,7 +295,127 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
         check=False,
     )
     assert help_result.returncode == 0, help_result.stderr
-    assert all(option in help_result.stdout for option in ("--python", "--recreate", "--help"))
+    assert all(
+        option in help_result.stdout for option in ("--python", "--recreate", "--help")
+    )
+
+
+def test_setup_script_discovers_both_virtual_environment_interpreter_layouts() -> None:
+    script = _required_file("scripts/setup_python_env.sh").read_text(encoding="utf-8")
+
+    assert re.search(r"^find_venv_python\(\)", script, flags=re.MULTILINE)
+    assert "Scripts/python.exe" in script
+    assert "bin/python" in script
+    assert "environment_python_relative" not in script
+    assert script.count('find_venv_python "$environment_dir"') >= 2
+
+
+def test_setup_script_reuses_an_existing_alternate_interpreter_layout(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "alternate-layout"
+    _write_minimal_bootstrap_project(project_root)
+
+    first_run = _run_setup(project_root)
+    assert first_run.returncode == 0, first_run.stderr
+
+    _, original_python, alternate_python = _environment_layouts(project_root)
+    assert original_python.is_file()
+    alternate_python.parent.mkdir(parents=True)
+    shutil.copy2(original_python, alternate_python)
+    alternate_python.chmod(0o755)
+    original_python.unlink()
+
+    reuse = _run_setup(project_root)
+    assert reuse.returncode == 0, reuse.stderr
+
+
+def test_setup_script_recreate_only_replaces_the_selected_environment(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "recreate"
+    _write_minimal_bootstrap_project(project_root)
+
+    first_run = _run_setup(project_root)
+    assert first_run.returncode == 0, first_run.stderr
+
+    environment_dir, _, _ = _environment_layouts(project_root)
+    environment_sentinel = environment_dir / "remove-on-recreate.txt"
+    root_sentinel = project_root / "keep-in-project.txt"
+    outside_sentinel = tmp_path / "keep-outside-project.txt"
+    wrong_environment = project_root / (
+        ".venv-linux" if os.name == "nt" else ".venv-win"
+    )
+    wrong_environment_sentinel = wrong_environment / "keep-wrong-environment.txt"
+    wrong_environment.mkdir()
+    for sentinel in (
+        environment_sentinel,
+        root_sentinel,
+        outside_sentinel,
+        wrong_environment_sentinel,
+    ):
+        sentinel.write_text("sentinel", encoding="utf-8")
+
+    recreated = _run_setup(project_root, "--recreate")
+    assert recreated.returncode == 0, recreated.stderr
+    assert not environment_sentinel.exists()
+    assert root_sentinel.read_text(encoding="utf-8") == "sentinel"
+    assert outside_sentinel.read_text(encoding="utf-8") == "sentinel"
+    assert wrong_environment_sentinel.read_text(encoding="utf-8") == "sentinel"
+
+    environment_dir, scripts_python, bin_python = _environment_layouts(project_root)
+    final_python = scripts_python if scripts_python.is_file() else bin_python
+    validity = subprocess.run(
+        [
+            str(final_python),
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "expected = Path(sys.argv[1]).resolve(); "
+                "prefix = Path(sys.prefix).resolve(); "
+                "raise SystemExit(0 if prefix == expected and sys.base_prefix != sys.prefix else 1)"
+            ),
+            str(environment_dir),
+        ],
+        check=False,
+    )
+    assert validity.returncode == 0
+
+
+def test_setup_script_recreate_damaged_environment_preserves_outside_files(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "damaged-recreate"
+    _write_minimal_bootstrap_project(project_root)
+    environment_dir, _, _ = _environment_layouts(project_root)
+    environment_dir.mkdir()
+    damaged_sentinel = environment_dir / "remove-damaged-environment.txt"
+    outside_sentinel = tmp_path / "preserve-outside-damaged-project.txt"
+    damaged_sentinel.write_text("damaged", encoding="utf-8")
+    outside_sentinel.write_text("outside", encoding="utf-8")
+
+    recreated = _run_setup(project_root, "--recreate")
+    assert recreated.returncode == 0, recreated.stderr
+    assert not damaged_sentinel.exists()
+    assert outside_sentinel.read_text(encoding="utf-8") == "outside"
+
+    environment_dir, scripts_python, bin_python = _environment_layouts(project_root)
+    final_python = scripts_python if scripts_python.is_file() else bin_python
+    validity = subprocess.run(
+        [
+            str(final_python),
+            "-c",
+            (
+                "import sys; from pathlib import Path; "
+                "expected = Path(sys.argv[1]).resolve(); "
+                "prefix = Path(sys.prefix).resolve(); "
+                "raise SystemExit(0 if prefix == expected and sys.base_prefix != sys.prefix else 1)"
+            ),
+            str(environment_dir),
+        ],
+        check=False,
+    )
+    assert validity.returncode == 0
 
 
 def test_setup_script_rejects_interpreter_from_a_different_venv(tmp_path: Path) -> None:
@@ -199,7 +446,9 @@ def test_setup_script_rejects_interpreter_from_a_different_venv(tmp_path: Path) 
     )
 
     assert result.returncode != 0
-    assert result.returncode != 86, "script reached pip instead of rejecting the reused interpreter"
+    assert result.returncode != 86, (
+        "script reached pip instead of rejecting the reused interpreter"
+    )
     assert "--recreate" in result.stderr
 
 

@@ -61,11 +61,9 @@ project_root="$(cd -- "$script_dir/.." && pwd -P)"
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
         environment_name=".venv-win"
-        environment_python_relative="Scripts/python.exe"
         ;;
     Linux*)
         environment_name=".venv-linux"
-        environment_python_relative="bin/python"
         ;;
     *)
         fail "unsupported platform: $(uname -s)"
@@ -73,7 +71,23 @@ case "$(uname -s)" in
 esac
 
 environment_dir="$project_root/$environment_name"
-environment_python="$environment_dir/$environment_python_relative"
+environment_python=""
+
+find_venv_python() {
+    local target_environment="$1"
+    local candidate
+
+    for candidate in \
+        "$target_environment/Scripts/python.exe" \
+        "$target_environment/bin/python"; do
+        if [[ -f "$candidate" && -x "$candidate" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    return 1
+}
 
 python_minor_version() {
     "$1" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
@@ -122,7 +136,7 @@ if [[ -e "$environment_dir" ]]; then
             || fail "Python 3.11 is required; found $source_version"
         safe_remove_environment "$environment_dir"
     else
-        [[ -f "$environment_python" ]] \
+        environment_python="$(find_venv_python "$environment_dir")" \
             || fail "existing environment is invalid; rerun with --recreate"
         validate_venv "$environment_python" "$environment_dir" \
             || fail "existing environment is invalid; rerun with --recreate"
@@ -140,6 +154,8 @@ if [[ "$create_environment" == true ]]; then
     [[ "$source_version" == "3.11" ]] \
         || fail "Python 3.11 is required; found $source_version"
     "$python_command" -m venv "$environment_dir"
+    environment_python="$(find_venv_python "$environment_dir")" \
+        || fail "created environment does not contain an executable Python interpreter"
 fi
 
 cd -- "$project_root"

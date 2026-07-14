@@ -37,6 +37,7 @@ dev = [
     "pytest-asyncio==1.4.0",
     "ruff==0.15.21",
     "mypy==2.2.0",
+    "pathspec==1.1.1",
 ]
 
 [tool.setuptools.packages.find]
