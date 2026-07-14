@@ -372,7 +372,7 @@ def test_inserted_name_is_not_reprocessed_as_an_env_prefix(template: Path) -> No
 
 @pytest.mark.parametrize(
     "name",
-    ["Acme Service-2.0 (Core)", "龙芯 服务_2.0"],
+    ["Acme 123", "龙芯 服务_2.0", "True Service"],
 )
 def test_safe_english_and_chinese_names_initialize(template: Path, name: str) -> None:
     arguments = ("--name", f"  {name}  ", *VALID_ARGUMENTS[2:])
@@ -405,6 +405,52 @@ def test_unsafe_or_overlong_names_are_rejected_without_writes(
     template: Path, name: str
 ) -> None:
     arguments = ("--name", name, *VALID_ARGUMENTS[2:])
+    before = _snapshot(template)
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode != 0
+    assert "name" in result.stderr.lower()
+    assert _snapshot(template) == before
+
+
+@pytest.mark.parametrize("name", ["-", "1234", "1.0", "2026-07-15"])
+def test_names_without_unicode_letters_are_rejected_without_writes(
+    template: Path, name: str
+) -> None:
+    arguments = ("--name", name, *VALID_ARGUMENTS[2:])
+    before = _snapshot(template)
+
+    result = _run_initializer(template, arguments)
+
+    assert result.returncode != 0
+    assert "name" in result.stderr.lower()
+    assert _snapshot(template) == before
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "null",
+        "~",
+        "TRUE",
+        "False",
+        "yes",
+        "NO",
+        "on",
+        "OFF",
+        "y",
+        "N",
+        ".inf",
+        "-.inf",
+        "+.inf",
+        ".nan",
+    ],
+)
+def test_yaml_implicit_scalar_names_are_rejected_after_trim_and_casefold(
+    template: Path, name: str
+) -> None:
+    arguments = ("--name", f"  {name}  ", *VALID_ARGUMENTS[2:])
     before = _snapshot(template)
 
     result = _run_initializer(template, arguments)

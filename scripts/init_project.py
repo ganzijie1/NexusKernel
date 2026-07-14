@@ -23,6 +23,24 @@ MAX_NAME_LENGTH = 80
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _ENV_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 _DISPLAY_NAME_RE = re.compile(r"^[\w .()\-]+$")
+_YAML_IMPLICIT_SCALARS = frozenset(
+    {
+        "null",
+        "~",
+        "true",
+        "false",
+        "yes",
+        "no",
+        "on",
+        "off",
+        "y",
+        "n",
+        ".inf",
+        "-.inf",
+        "+.inf",
+        ".nan",
+    }
+)
 _DEFAULT_NAME_RE = re.compile(
     rf"(?<![A-Za-z0-9_]){re.escape(DEFAULT_NAME)}(?![A-Za-z0-9_])"
 )
@@ -81,6 +99,10 @@ def _validate_identity(identity: ProjectIdentity) -> ProjectIdentity:
         )
     if name.startswith("- "):
         _fail("name must be safe as a plain configuration value")
+    if not any(character.isalpha() for character in name):
+        _fail("name must contain at least one Unicode letter")
+    if name.casefold() in _YAML_IMPLICIT_SCALARS:
+        _fail("name must not be a YAML implicit scalar keyword")
     if not _SLUG_RE.fullmatch(identity.slug):
         _fail(
             "slug must contain only lowercase letters and digits separated by "
