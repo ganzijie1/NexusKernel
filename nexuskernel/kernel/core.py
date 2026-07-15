@@ -6,7 +6,7 @@ import asyncio
 import heapq
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from nexuskernel.errors import (
     KernelStartupError,
@@ -16,7 +16,9 @@ from nexuskernel.errors import (
 )
 from nexuskernel.kernel.loader import LoadedModule
 from nexuskernel.kernel.module import HttpEndpointSpec, Module, ModuleState
-from nexuskernel.providers import ProviderRegistry
+
+if TYPE_CHECKING:
+    from nexuskernel.providers import ProviderRegistry
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +70,11 @@ class Kernel:
         entries = list(modules)
         self._entries = self._index_entries(entries)
         self._ordered = self._resolve_topology(entries)
-        self._providers = providers or ProviderRegistry()
+        if providers is None:
+            from nexuskernel.providers import ProviderRegistry
+
+            providers = ProviderRegistry()
+        self._providers = providers
         self._started: list[LoadedModule] = []
         self._module_errors: dict[str, str | None] = {
             entry.module.name: None for entry in entries

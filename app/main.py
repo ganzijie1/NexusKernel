@@ -1,5 +1,5 @@
 """ASGI entry point used by local development and the API container role."""
 
-from nexuskernel.gateway import create_app
+from app.bootstrap import create_application
 
-app = create_app()
+app = create_application()

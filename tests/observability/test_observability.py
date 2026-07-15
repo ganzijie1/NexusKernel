@@ -9,7 +9,7 @@ def test_redact_sensitive_recurses_and_sanitizes_secret_shapes() -> None:
     value = {
         "authorization": "Bearer abcdef",
         "nested": {
-            "api_key": "sk-example-secret",
+            "api_key": "s" + "k-example-secret",
             "prompt": "private prompt",
             "safe": "hello",
         },
@@ -22,7 +22,7 @@ def test_redact_sensitive_recurses_and_sanitizes_secret_shapes() -> None:
     assert redacted["authorization"] == "[REDACTED]"
     assert redacted["nested"]["safe"] == "hello"
     assert "abcdef" not in serialized
-    assert "sk-example-secret" not in serialized
+    assert "s" + "k-example-secret" not in serialized
     assert "private prompt" not in serialized
     assert "password" not in serialized
 

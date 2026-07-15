@@ -16,6 +16,14 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import Response
 
+from nexuskernel.ai import (
+    AiProviderUnavailableError,
+    AuthNotConfiguredError,
+    ChatRequest,
+    ChatService,
+    DisabledChatService,
+    UnauthorizedError,
+)
 from nexuskernel.config import (
     ApplicationSettings,
     load_application_settings,
@@ -38,6 +46,7 @@ _BUILTIN_ROUTES = {
     ("GET", "/health/live"),
     ("GET", "/health/ready"),
     ("GET", "/metrics"),
+    ("POST", "/api/v1/chat"),
 }
 
 
@@ -156,6 +165,7 @@ def create_app(
     settings: ApplicationSettings | None = None,
     kernel: Kernel | None = None,
     metrics: MetricsRegistry | None = None,
+    chat_service: ChatService | None = None,
 ) -> FastAPI:
     settings = settings or _default_settings()
     kernel = kernel or _default_kernel()
@@ -163,6 +173,7 @@ def create_app(
         settings.monitoring.metrics_prefix,
         cache_ttl_seconds=settings.monitoring.metrics_cache_ttl_seconds,
     )
+    chat_service = chat_service or DisabledChatService()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -207,6 +218,32 @@ def create_app(
             "service_unavailable", "Service is unavailable.", status_code=503
         )
 
+    @app.exception_handler(AuthNotConfiguredError)
+    async def handle_auth_not_configured(
+        request: Request, exc: AuthNotConfiguredError
+    ) -> Response:
+        return error_response(
+            "auth_not_configured",
+            "Chat authentication is not configured.",
+            status_code=503,
+        )
+
+    @app.exception_handler(UnauthorizedError)
+    async def handle_unauthorized(request: Request, exc: UnauthorizedError) -> Response:
+        return error_response(
+            "unauthorized", "Authentication is required.", status_code=401
+        )
+
+    @app.exception_handler(AiProviderUnavailableError)
+    async def handle_ai_unavailable(
+        request: Request, exc: AiProviderUnavailableError
+    ) -> Response:
+        return error_response(
+            "ai_provider_unavailable",
+            "AI provider is unavailable.",
+            status_code=503,
+        )
+
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, exc: Exception) -> Response:
         return error_response(
@@ -240,6 +277,13 @@ def create_app(
     @app.get("/metrics", include_in_schema=False)
     async def prometheus_metrics() -> Response:
         return Response(content=metrics.render(), media_type=metrics.content_type)
+
+    @app.post("/api/v1/chat", tags=["chat"])
+    async def chat(request: ChatRequest, http_request: Request) -> Response:
+        response = await chat_service.chat(
+            request, http_request.headers.get("authorization")
+        )
+        return success_response(response)
 
     try:
         _register_module_routes(app, kernel)

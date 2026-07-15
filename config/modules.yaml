@@ -4,3 +4,15 @@ modules:
     enabled: true
     required: true
     config: {}
+  chat:
+    class: app.modules.chat.ChatModule
+    enabled: true
+    required: false
+    config:
+      provider_id: ${NEXUSKERNEL_AI_PROVIDER:-openai_compatible}
+      model: ${NEXUSKERNEL_AI_MODEL:-gpt-4.1-mini}
+      service_bearer_token: ${NEXUSKERNEL_SERVICE_BEARER_TOKEN:-}
+      ai_api_key: ${NEXUSKERNEL_AI_API_KEY:-}
+      base_url: ${NEXUSKERNEL_AI_BASE_URL:-}
+      timeout_seconds: ${NEXUSKERNEL_AI_TIMEOUT_SECONDS:-30}
+      session_ttl_seconds: ${NEXUSKERNEL_ADK_SESSION_TTL_SECONDS:-1800}
