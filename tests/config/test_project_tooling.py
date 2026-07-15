@@ -40,6 +40,7 @@ OPTIONAL_DEPENDENCIES = {
         "ruff==0.15.21",
         "mypy==2.2.0",
         "pathspec==1.1.1",
+        "types-PyYAML==6.0.12.20260518",
     ],
 }
 
