@@ -414,7 +414,10 @@ def test_unsafe_or_overlong_names_are_rejected_without_writes(
     assert _snapshot(template) == before
 
 
-@pytest.mark.parametrize("name", ["-", "1234", "1.0", "2026-07-15"])
+@pytest.mark.parametrize(
+    "name",
+    ["-", "1234", "1.0", "2026-07-15", "0xFF", "0xCAFE", "0b1010"],
+)
 def test_names_without_unicode_letters_are_rejected_without_writes(
     template: Path, name: str
 ) -> None:

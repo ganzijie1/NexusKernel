@@ -99,8 +99,8 @@ def _validate_identity(identity: ProjectIdentity) -> ProjectIdentity:
         )
     if name.startswith("- "):
         _fail("name must be safe as a plain configuration value")
-    if not any(character.isalpha() for character in name):
-        _fail("name must contain at least one Unicode letter")
+    if not name[0].isalpha():
+        _fail("name must start with a Unicode letter")
     if name.casefold() in _YAML_IMPLICIT_SCALARS:
         _fail("name must not be a YAML implicit scalar keyword")
     if not _SLUG_RE.fullmatch(identity.slug):
