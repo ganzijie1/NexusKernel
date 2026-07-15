@@ -33,6 +33,7 @@ def test_application_settings_defaults_and_forbids_unknown_fields() -> None:
     ("section", "field", "value"),
     [
         ("server", "max_request_body_bytes", 0),
+        ("server", "request_timeout_seconds", 0),
         ("monitoring", "metrics_cache_ttl_seconds", 0),
         ("monitoring", "health_timeout_seconds", -1),
     ],

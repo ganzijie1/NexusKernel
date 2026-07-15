@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import heapq
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from nexuskernel.errors import (
@@ -14,8 +15,15 @@ from nexuskernel.errors import (
     ModuleLookupError,
 )
 from nexuskernel.kernel.loader import LoadedModule
-from nexuskernel.kernel.module import Module, ModuleState
+from nexuskernel.kernel.module import HttpEndpointSpec, Module, ModuleState
 from nexuskernel.providers import ProviderRegistry
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleRouteBinding:
+    module_name: str
+    spec: HttpEndpointSpec
+    handler: Callable[..., Any]
 
 
 class ModuleApiProxy:
@@ -139,6 +147,30 @@ class Kernel:
         except KeyError as exc:
             raise ModuleLookupError(f"Module is not registered: {name}") from exc
         return ModuleApiProxy(module)
+
+    def route_bindings(self) -> list[ModuleRouteBinding]:
+        """Return declared endpoint specs paired with contract-limited handlers."""
+
+        bindings: list[ModuleRouteBinding] = []
+        for entry in self._ordered:
+            proxy = self.get_module(entry.module.name)
+            for endpoint in entry.module.get_http_endpoints():
+                try:
+                    handler = getattr(proxy, endpoint.target_api)
+                except ModuleAccessError as exc:
+                    raise ModuleDependencyError(
+                        "HTTP endpoint target is outside its module API contract: "
+                        f"{entry.module.name}.{endpoint.target_api}"
+                    ) from exc
+                if not callable(handler):
+                    raise ModuleDependencyError(
+                        "HTTP endpoint target must be callable: "
+                        f"{entry.module.name}.{endpoint.target_api}"
+                    )
+                bindings.append(
+                    ModuleRouteBinding(entry.module.name, endpoint, handler)
+                )
+        return bindings
 
     async def start(self) -> None:
         if self._running:

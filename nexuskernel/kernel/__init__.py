@@ -1,6 +1,6 @@
 """Stable public module extension interfaces."""
 
-from nexuskernel.kernel.core import Kernel, ModuleApiProxy
+from nexuskernel.kernel.core import Kernel, ModuleApiProxy, ModuleRouteBinding
 from nexuskernel.kernel.loader import LoadedModule, load_modules
 from nexuskernel.kernel.module import (
     HttpEndpointSpec,
@@ -16,6 +16,7 @@ __all__ = [
     "LoadedModule",
     "Module",
     "ModuleApiProxy",
+    "ModuleRouteBinding",
     "ModuleConfig",
     "ModuleState",
     "ProviderState",

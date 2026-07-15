@@ -1,0 +1,6 @@
+modules:
+  example:
+    class: app.modules.example.ExampleModule
+    enabled: true
+    required: true
+    config: {}
