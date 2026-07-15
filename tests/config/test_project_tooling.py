@@ -30,9 +30,9 @@ OPTIONAL_DEPENDENCIES = {
     "redis": ["redis==8.0.1"],
     "qdrant": ["qdrant-client==1.18.0"],
     "otel": [
-        "opentelemetry-api==1.43.0",
-        "opentelemetry-sdk==1.43.0",
-        "opentelemetry-exporter-otlp-proto-grpc==1.43.0",
+        "opentelemetry-api==1.41.1",
+        "opentelemetry-sdk==1.41.1",
+        "opentelemetry-exporter-otlp-proto-grpc==1.41.1",
     ],
     "dev": [
         "pytest==9.1.1",

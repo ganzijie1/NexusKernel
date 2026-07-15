@@ -60,6 +60,8 @@ Environment: NEXUSKERNEL_API_KEY
 Package: nexuskernel
 NEXUSKERNEL_DEFAULT_PORT=8030
 Historical example: 8030
+CLI example: --port 8030
+Local URL: http://127.0.0.1:8030
 Unrelated assignment: OTHER_DEFAULT_PORT=8030
 Embedded display text: BeforeNexusKernel StarterAfter
 """,
@@ -84,14 +86,14 @@ include = ["nexuskernel*"]
     )
     _write(
         project / "docker/Dockerfile",
-        "ENV NEXUSKERNEL_DEFAULT_PORT=8030\n",
+        "ENV NEXUSKERNEL_DEFAULT_PORT=8030\nEXPOSE 8030\n",
     )
     _write(
         project / "docker/docker-compose-dev.yml",
         """services:
   api:
     ports:
-      - "${NEXUSKERNEL_PORT:-8030}:8030"
+      - "${NEXUSKERNEL_PORT:-8030}:${NEXUSKERNEL_PORT:-8030}"
       - "${OTHER_PORT:-8030}:8030"
     labels:
       sample-port: "8030"
@@ -100,12 +102,14 @@ include = ["nexuskernel*"]
     _write(
         project / "docker/.env.example",
         """NEXUSKERNEL_DEFAULT_PORT=8030
+NEXUSKERNEL_PORT=8030
 NEXUSKERNEL_API_KEY=
 """,
     )
     _write(
         project / "docker/.env.dev.example",
         """NEXUSKERNEL_DEFAULT_PORT=8030
+NEXUSKERNEL_PORT=8030
 NEXUSKERNEL_API_KEY=
 DATABASE_URL=${DATABASE_URL:-}
 HOST=localhost
@@ -277,6 +281,7 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     pyproject = (template / "pyproject.toml").read_text(encoding="utf-8")
     config = (template / "config/settings.yaml").read_text(encoding="utf-8")
     compose = (template / "docker/docker-compose-dev.yml").read_text(encoding="utf-8")
+    dockerfile = (template / "docker/Dockerfile").read_text(encoding="utf-8")
     generated_base_env = (template / "docker/.env").read_text(encoding="utf-8")
     generated_env = (template / "docker/.env.dev").read_text(encoding="utf-8")
     nested_doc = (template / "docs/guide/nested.md").read_text(encoding="utf-8")
@@ -289,18 +294,23 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     assert "NEXUSKERNEL_DEFAULT_PORT=8030" not in readme
     assert "ACME_AI_DEFAULT_PORT=9123" in readme
     assert "Historical example: 8030" in readme
+    assert "CLI example: --port 9123" in readme
+    assert "Local URL: http://127.0.0.1:9123" in readme
     assert "Unrelated assignment: OTHER_DEFAULT_PORT=8030" in readme
     assert "Embedded display text: BeforeNexusKernel StarterAfter" in readme
     assert 'name = "acme-intelligence"' in pyproject
     assert 'include = ["nexuskernel*"]' in pyproject
     assert "  port: 9123" in config
     assert "  sample_year: 8030" in config
-    assert "${ACME_AI_PORT:-9123}:8030" in compose
+    assert "${ACME_AI_PORT:-9123}:${ACME_AI_PORT:-9123}" in compose
     assert "${OTHER_PORT:-8030}:8030" in compose
     assert 'sample-port: "8030"' in compose
+    assert "EXPOSE 9123" in dockerfile
     assert "ACME_AI_DEFAULT_PORT=9123" in generated_base_env
+    assert "ACME_AI_PORT=9123" in generated_base_env
     assert "ACME_AI_API_KEY=" in generated_base_env
     assert "ACME_AI_DEFAULT_PORT=9123" in generated_env
+    assert "ACME_AI_PORT=9123" in generated_env
     assert "ACME_AI_API_KEY=" in generated_env
     assert "Acme Intelligence" in nested_doc
     assert "nexuskernel" in readme

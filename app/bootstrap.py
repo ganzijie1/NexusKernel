@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 
 from fastapi import FastAPI
@@ -10,6 +11,7 @@ from pydantic import ValidationError
 from app.modules.chat import ChatModuleConfig, create_ai_runtime
 from app.services import AppChatService
 from nexuskernel.config import (
+    ApplicationSettings,
     load_application_settings,
     load_module_definitions,
 )
@@ -22,20 +24,35 @@ from nexuskernel.providers import ProviderRegistry, ProviderSpec
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def create_application(
+@dataclass(frozen=True, slots=True)
+class ApplicationRuntime:
+    settings: ApplicationSettings
+    kernel: Kernel
+    chat_service: AppChatService
+
+
+def _project_root() -> Path:
+    working_root = Path.cwd()
+    if (working_root / "config" / "application.yaml").is_file():
+        return working_root
+    return _PROJECT_ROOT
+
+
+def build_runtime(
     *,
     application_config: str | Path | None = None,
     modules_config: str | Path | None = None,
-) -> FastAPI:
+) -> ApplicationRuntime:
+    project_root = _project_root()
     application_path = (
         Path(application_config)
         if application_config
-        else (_PROJECT_ROOT / "config" / "application.yaml")
+        else (project_root / "config" / "application.yaml")
     )
     modules_path = (
         Path(modules_config)
         if modules_config
-        else (_PROJECT_ROOT / "config" / "modules.yaml")
+        else (project_root / "config" / "modules.yaml")
     )
     settings = load_application_settings(application_path)
     definitions = load_module_definitions(modules_path)
@@ -65,8 +82,20 @@ def create_application(
         else None
     )
     chat_service = AppChatService(registry, service_token=service_token)
+    return ApplicationRuntime(settings, kernel, chat_service)
+
+
+def create_application(
+    *,
+    application_config: str | Path | None = None,
+    modules_config: str | Path | None = None,
+) -> FastAPI:
+    runtime = build_runtime(
+        application_config=application_config,
+        modules_config=modules_config,
+    )
     return create_app(
-        settings=settings,
-        kernel=kernel,
-        chat_service=chat_service,
+        settings=runtime.settings,
+        kernel=runtime.kernel,
+        chat_service=runtime.chat_service,
     )

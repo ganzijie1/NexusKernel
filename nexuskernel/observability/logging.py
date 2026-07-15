@@ -19,7 +19,7 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]+")
-_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
+_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")  # security-pattern
 _CREDENTIAL_URL = re.compile(
     r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@",
     re.IGNORECASE,

@@ -1,0 +1,64 @@
+stages:
+  - quality
+  - test
+  - package
+  - container-smoke
+
+default:
+  image: python:3.11-slim
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends bash git && rm -rf /var/lib/apt/lists/*
+    - python -m pip install --disable-pip-version-check ".[ai,dev]"
+
+quality:
+  stage: quality
+  script:
+    - python -m compileall -q nexuskernel app
+    - ruff format --check .
+    - ruff check .
+    - mypy nexuskernel app scripts/init_project.py
+    - python -m pip check
+    - python scripts/security_scan.py
+
+test:
+  stage: test
+  script:
+    - pytest -m "not real_llm" -q
+
+real-llm-smoke:
+  stage: test
+  rules:
+    - if: '$RUN_REAL_LLM_SMOKE == "true" && $NEXUSKERNEL_AI_API_KEY'
+    - when: never
+  script:
+    - pytest -m real_llm -q
+
+wheel:
+  stage: package
+  script:
+    - python -m pip wheel --no-deps --wheel-dir dist .
+  artifacts:
+    paths: [dist/]
+
+container-smoke:
+  stage: container-smoke
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script: []
+  script:
+    - docker compose -f docker/docker-compose-dev.yml config --quiet
+    - docker compose -f docker/docker-compose-preprod.yml config --quiet
+    - docker compose -f docker/docker-compose-prod.yml config --quiet
+    - docker build -f docker/Dockerfile -t nexuskernel-starter:ci .
+    - test "$(docker run --rm nexuskernel-starter:ci id -u)" = "10001"
+    - docker run --rm -d --name nexuskernel-api -e NEXUSKERNEL_PORT=8030 -p 8030:8030 nexuskernel-starter:ci
+    - until wget -qO- http://docker:8030/health/live; do sleep 1; done
+    - wget -qO- http://docker:8030/health/ready
+    - docker rm -f nexuskernel-api
+    - docker run --rm -d --name nexuskernel-worker -e NEXUSKERNEL_RUNTIME_ROLE=worker nexuskernel-starter:ci
+    - test "$(docker inspect -f '{{.State.Running}}' nexuskernel-worker)" = "true"
+    - docker rm -f nexuskernel-worker

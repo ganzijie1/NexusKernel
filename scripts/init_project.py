@@ -214,7 +214,7 @@ def _replacement_pattern(relative_path: str) -> re.Pattern[str]:
     alternatives = [
         (
             rf"(?P<port_assignment>(?<![A-Z0-9_]){DEFAULT_ENV_PREFIX}"
-            rf"(?P<assignment_middle>_DEFAULT_PORT[ \t]*=[ \t]*)"
+            rf"(?P<assignment_middle>_(?:DEFAULT_)?PORT[ \t]*=[ \t]*)"
             rf"{DEFAULT_PORT}(?![0-9]))"
         ),
         (
@@ -224,11 +224,20 @@ def _replacement_pattern(relative_path: str) -> re.Pattern[str]:
             r"(?P<yaml_key_close_quote>[\"']?)(?![0-9]))"
         ),
     ]
-    if relative_path.startswith("docker/docker-compose-") and relative_path.endswith(
-        ".yml"
-    ):
+    if relative_path.endswith((".yaml", ".yml")):
         alternatives.append(
             rf"(?P<compose_port>\$\{{{DEFAULT_ENV_PREFIX}_PORT:-{DEFAULT_PORT}\}})"
+        )
+    if relative_path == "docker/Dockerfile":
+        alternatives.append(
+            rf"(?P<docker_expose>^(?P<docker_expose_prefix>EXPOSE[ \t]+){DEFAULT_PORT}(?P<docker_expose_suffix>[ \t]*\r?$))"
+        )
+    if relative_path == "README.md":
+        alternatives.extend(
+            [
+                rf"(?P<readme_cli_port>(?P<readme_cli_prefix>--port[ \t]+){DEFAULT_PORT}(?![0-9]))",
+                rf"(?P<readme_url_port>(?P<readme_url_prefix>127\.0\.0\.1:){DEFAULT_PORT}(?![0-9]))",
+            ]
         )
     if relative_path.endswith((".yaml", ".yml")):
         alternatives.append(
@@ -269,6 +278,18 @@ def _transform_text(
         if "compose_port" in match.re.groupindex and match.group("compose_port"):
             hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
             return f"${{{identity.env_prefix}_PORT:-{port}}}"
+        if "docker_expose" in match.re.groupindex and match.group("docker_expose"):
+            hits.add(_PORT_TOKEN)
+            return (
+                f"{match.group('docker_expose_prefix')}{port}"
+                f"{match.group('docker_expose_suffix')}"
+            )
+        if "readme_cli_port" in match.re.groupindex and match.group("readme_cli_port"):
+            hits.add(_PORT_TOKEN)
+            return f"{match.group('readme_cli_prefix')}{port}"
+        if "readme_url_port" in match.re.groupindex and match.group("readme_url_port"):
+            hits.add(_PORT_TOKEN)
+            return f"{match.group('readme_url_prefix')}{port}"
         if "yaml_port" in match.re.groupindex and match.group("yaml_port"):
             hits.add(_PORT_TOKEN)
             return (
