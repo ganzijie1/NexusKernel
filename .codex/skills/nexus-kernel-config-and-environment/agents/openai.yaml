@@ -1,0 +1,4 @@
+interface:
+  display_name: "NexusKernel 配置与环境"
+  short_description: "用于维护严格配置、Provider 配置、依赖 extras 与跨平台 Python 环境"
+  default_prompt: "Use $nexus-kernel-config-and-environment to change providers, dependency extras, initialization, or Python environments."

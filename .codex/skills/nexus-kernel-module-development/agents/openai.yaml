@@ -1,0 +1,4 @@
+interface:
+  display_name: "NexusKernel 模块开发"
+  short_description: "用于开发和审查模块包结构、声明依赖、Provider、Worker 与生命周期"
+  default_prompt: "Use $nexus-kernel-module-development to add or review a module with declared dependencies, providers, and workers."

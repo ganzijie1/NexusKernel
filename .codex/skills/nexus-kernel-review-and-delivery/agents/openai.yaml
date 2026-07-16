@@ -1,0 +1,4 @@
+interface:
+  display_name: "NexusKernel 审查与交付"
+  short_description: "用于审查 wheel 元数据、Docker、CI、安全合同与交付证据"
+  default_prompt: "Use $nexus-kernel-review-and-delivery to verify wheel metadata, CI, Docker, security, and delivery evidence."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "NexusKernel AI 集成"
+  short_description: "用于接入和审查 AI 适配器、服务端工具、usage、会话与资源关闭"
+  default_prompt: "Use $nexus-kernel-ai-integration to add or review an AI provider, agent runtime, or server tool."
