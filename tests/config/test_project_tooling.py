@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ CORE_DEPENDENCIES = [
     "prometheus-client==0.25.0",
     "loguru==0.7.3",
     "httpx==0.28.1",
+    "jsonschema==4.26.0",
 ]
 
 OPTIONAL_DEPENDENCIES = {
@@ -34,7 +36,10 @@ OPTIONAL_DEPENDENCIES = {
         "opentelemetry-sdk==1.41.1",
         "opentelemetry-exporter-otlp-proto-grpc==1.41.1",
     ],
+    "postgres": ["asyncpg==0.31.0"],
     "dev": [
+        "build==1.5.1",
+        "packaging==26.2",
         "pytest==9.1.1",
         "pytest-asyncio==1.4.0",
         "ruff==0.15.21",
@@ -64,6 +69,13 @@ def _find_bash() -> str:
     pytest.skip("Bash is required to verify scripts/setup_python_env.sh")
 
 
+def _find_powershell() -> str:
+    for candidate in (shutil.which("pwsh"), shutil.which("powershell")):
+        if candidate:
+            return candidate
+    pytest.skip("PowerShell is required to verify scripts/setup_python_env.ps1")
+
+
 def _required_file(relative_path: str) -> Path:
     path = ROOT / relative_path
     assert path.is_file(), f"missing required project file: {relative_path}"
@@ -73,6 +85,13 @@ def _required_file(relative_path: str) -> Path:
 def _load_pyproject() -> dict[str, object]:
     with _required_file("pyproject.toml").open("rb") as stream:
         return tomllib.load(stream)
+
+
+def _project_distribution() -> str:
+    distribution = _load_pyproject()["project"]["name"]
+    assert isinstance(distribution, str)
+    assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", distribution)
+    return distribution
 
 
 def _meaningful_lines(relative_path: str) -> set[str]:
@@ -100,6 +119,7 @@ def _write_minimal_bootstrap_project(project_root: Path) -> None:
     script_dir.mkdir(parents=True)
     package_dir.mkdir()
     shutil.copy2(_required_file("scripts/setup_python_env.sh"), script_dir)
+    shutil.copy2(_required_file("scripts/check_python_version.py"), script_dir)
     (package_dir / "__init__.py").write_text("", encoding="utf-8")
     (project_root / "bootstrap_backend.py").write_text(
         """from pathlib import Path
@@ -157,7 +177,7 @@ backend-path = ["."]
 [project]
 name = "bootstrap-test-project"
 version = "0.0.0"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.14"
 
 [project.optional-dependencies]
 ai = []
@@ -204,7 +224,9 @@ def _environment_layouts(project_root: Path) -> tuple[Path, Path, Path]:
             environment_dir / "bin/python",
         )
 
-    environment_dir = project_root / ".venv-linux"
+    environment_dir = project_root / (
+        ".venv-macos" if platform.system() == "Darwin" else ".venv-linux"
+    )
     return (
         environment_dir,
         environment_dir / "bin/python",
@@ -224,13 +246,11 @@ def test_pyproject_defines_build_and_core_project_contract() -> None:
 
     build_system = config["build-system"]
     assert build_system["build-backend"] == "setuptools.build_meta"
-    assert any(
-        requirement.startswith("setuptools") for requirement in build_system["requires"]
-    )
+    assert build_system["requires"] == ["setuptools==83.0.0"]
 
     project = config["project"]
-    assert project["name"] == "nexuskernel-starter"
-    assert project["requires-python"] == ">=3.11,<3.12"
+    assert project["name"] == _project_distribution()
+    assert project["requires-python"] == ">=3.11,<3.14"
     assert project["dependencies"] == CORE_DEPENDENCIES
 
 
@@ -244,20 +264,71 @@ def test_pyproject_discovers_packages_and_configures_tools() -> None:
     config = _load_pyproject()
 
     assert config["tool"]["setuptools"]["packages"]["find"]["include"] == [
-        "nexuskernel*",
+        "nexus_kernel*",
         "app*",
     ]
     assert config["tool"]["pytest"]["ini_options"]["asyncio_mode"] == "auto"
     assert config["tool"]["ruff"]["target-version"] == "py311"
-    assert config["tool"]["mypy"]["files"] == ["app", "nexuskernel"]
+    assert config["tool"]["ruff"]["lint"]["extend-select"] == ["C90"]
+    assert config["tool"]["ruff"]["lint"]["mccabe"]["max-complexity"] == 18
+    assert config["tool"]["mypy"]["files"] == ["app", "nexus_kernel"]
 
 
 def test_import_package_roots_exist() -> None:
-    assert _required_file("nexuskernel/__init__.py")
+    assert _required_file("nexus_kernel/__init__.py")
     assert _required_file("app/__init__.py")
 
 
-def test_setup_script_has_strict_python_311_environment_contract() -> None:
+def test_repository_uses_ecosystem_specific_nexus_kernel_identifiers() -> None:
+    project = _load_pyproject()["project"]
+    tool_config = _load_pyproject()["tool"]
+
+    assert project["name"] == _project_distribution()
+    assert tool_config["setuptools"]["packages"]["find"]["include"] == [
+        "nexus_kernel*",
+        "app*",
+    ]
+    assert tool_config["mypy"]["files"] == ["app", "nexus_kernel"]
+    legacy_package = "nexus" + "kernel"
+    legacy_env_prefix = "NEXUS" + "KERNEL"
+    assert _required_file("nexus_kernel/__init__.py")
+    assert not (ROOT / legacy_package).exists()
+
+    inventory = subprocess.run(
+        ["git", "ls-files", "--cached"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    relative_paths = inventory.stdout.splitlines()
+    tracked_paths = set(relative_paths)
+    framework_sources = {
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "nexus_kernel").rglob("*")
+        if path.is_file() and "__pycache__" not in path.parts
+    }
+    assert framework_sources <= tracked_paths, "nexus_kernel sources must be tracked"
+
+    offenders: list[str] = []
+    for relative_path in relative_paths:
+        path = ROOT / relative_path
+        if not path.is_file():
+            continue
+        if legacy_package in relative_path:
+            offenders.append(relative_path)
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if legacy_package in content or legacy_env_prefix in content:
+            offenders.append(relative_path)
+
+    assert offenders == []
+
+
+def test_setup_script_has_supported_python_environment_contract() -> None:
     script_path = _required_file("scripts/setup_python_env.sh")
     script = script_path.read_text(encoding="utf-8")
     bash = _find_bash()
@@ -265,15 +336,21 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
     assert "set -euo pipefail" in script
     assert all(option in script for option in ("--python", "--recreate", "--help"))
     assert all(
-        platform in script for platform in ("MINGW*", "MSYS*", "CYGWIN*", "Linux*")
+        platform in script
+        for platform in ("MINGW*", "MSYS*", "CYGWIN*", "Linux*", "Darwin*")
     )
-    assert all(environment in script for environment in (".venv-win", ".venv-linux"))
-    assert "3.11" in script
-    assert "pip install --upgrade pip" in script
+    assert all(
+        environment in script
+        for environment in (".venv-win", ".venv-linux", ".venv-macos")
+    )
+    assert "check_python_version.py" in script
+    assert '"$python_command" "$version_checker" --quiet' in script
+    assert '"$environment_python" -m pip install --upgrade pip' in script
     assert '--editable ".[ai,dev]"' in script
     assert "rm -rf --" in script
     assert "$project_root/.venv-win" in script
     assert "$project_root/.venv-linux" in script
+    assert "$project_root/.venv-macos" in script
     assert "validate_venv" in script
     assert "sys.prefix" in script
     assert "sys.base_prefix" in script
@@ -299,6 +376,95 @@ def test_setup_script_has_strict_python_311_environment_contract() -> None:
     assert all(
         option in help_result.stdout for option in ("--python", "--recreate", "--help")
     )
+
+
+def test_powershell_setup_script_has_equivalent_windows_contract() -> None:
+    script = _required_file("scripts/setup_python_env.ps1").read_text(encoding="utf-8")
+
+    assert all(option in script for option in ("Python", "Recreate", "Help"))
+    assert ".venv-win" in script
+    assert "check_python_version.py" in script
+    assert '"--quiet"' in script
+    assert "sys.prefix" in script
+    assert "sys.base_prefix" in script
+    assert '"pip", "install", "--upgrade", "pip"' in script
+    assert ".[ai,dev]" in script
+    assert "Remove-Item" in script
+
+    help_result = subprocess.run(
+        [
+            _find_powershell(),
+            "-NoProfile",
+            "-File",
+            str(ROOT / "scripts/setup_python_env.ps1"),
+            "-Help",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert help_result.returncode == 0, help_result.stderr
+    assert all(
+        option in help_result.stdout for option in ("-Python", "-Recreate", "-Help")
+    )
+
+
+@pytest.mark.skipif(os.name != "nt", reason="PowerShell setup targets Windows")
+def test_powershell_setup_creates_reuses_and_recreates_environment(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "powershell-setup"
+    _write_minimal_bootstrap_project(project_root)
+    shutil.copy2(
+        _required_file("scripts/setup_python_env.ps1"), project_root / "scripts"
+    )
+    command = [
+        _find_powershell(),
+        "-NoProfile",
+        "-File",
+        "scripts/setup_python_env.ps1",
+        "-Python",
+        sys.executable,
+    ]
+    environment = os.environ.copy()
+    environment.update({"PIP_DISABLE_PIP_VERSION_CHECK": "1", "PIP_NO_INDEX": "1"})
+
+    first = subprocess.run(
+        command,
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert first.returncode == 0, first.stderr
+    sentinel = project_root / ".venv-win" / "replace-on-recreate.txt"
+    sentinel.write_text("sentinel", encoding="utf-8")
+    reused = subprocess.run(
+        command,
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    recreated = subprocess.run(
+        [*command, "-Recreate"],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert reused.returncode == 0, reused.stderr
+    assert recreated.returncode == 0, recreated.stderr
+    assert not sentinel.exists()
+    assert (project_root / ".venv-win" / "Scripts" / "python.exe").is_file()
 
 
 def test_setup_script_discovers_both_virtual_environment_interpreter_layouts() -> None:
@@ -329,6 +495,37 @@ def test_setup_script_reuses_an_existing_alternate_interpreter_layout(
 
     reuse = _run_setup(project_root)
     assert reuse.returncode == 0, reuse.stderr
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Git Bash PATH layout is Windows-specific")
+def test_setup_script_reuses_existing_environment_without_global_python(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "reuse-without-global-python"
+    _write_minimal_bootstrap_project(project_root)
+    first_run = _run_setup(project_root)
+    assert first_run.returncode == 0, first_run.stderr
+
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PATH": "/usr/bin:/bin",
+            "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+            "PIP_NO_INDEX": "1",
+        }
+    )
+    reused = subprocess.run(
+        [_find_bash(), "scripts/setup_python_env.sh"],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+
+    assert reused.returncode == 0, reused.stderr
+    assert "could not find Python" not in reused.stderr
 
 
 def test_setup_script_recreate_only_replaces_the_selected_environment(
@@ -424,11 +621,10 @@ def test_setup_script_rejects_interpreter_from_a_different_venv(tmp_path: Path) 
     script_dir = project_root / "scripts"
     script_dir.mkdir(parents=True)
     shutil.copy2(_required_file("scripts/setup_python_env.sh"), script_dir)
+    shutil.copy2(_required_file("scripts/check_python_version.py"), script_dir)
 
-    if os.name == "nt":
-        environment_python = project_root / ".venv-win/Scripts/python.exe"
-    else:
-        environment_python = project_root / ".venv-linux/bin/python"
+    _, scripts_python, bin_python = _environment_layouts(project_root)
+    environment_python = scripts_python if os.name == "nt" else bin_python
     environment_python.parent.mkdir(parents=True)
     environment_python.write_text(
         "#!/usr/bin/env bash\n"
@@ -459,6 +655,7 @@ def test_gitignore_excludes_generated_and_secret_files_but_allows_examples() -> 
     ignored = [
         ".venv-win/pyvenv.cfg",
         ".venv-linux/pyvenv.cfg",
+        ".venv-macos/pyvenv.cfg",
         "app/__pycache__/module.cpython-311.pyc",
         ".pytest_cache/state",
         ".mypy_cache/state",
@@ -466,6 +663,8 @@ def test_gitignore_excludes_generated_and_secret_files_but_allows_examples() -> 
         "build/artifact.whl",
         "dist/artifact.whl",
         "runtime.log",
+        "runtime.out",
+        "runtime.err",
         "logs/runtime.log",
         ".env",
         ".env.local",
@@ -484,6 +683,7 @@ def test_dockerignore_excludes_repository_only_and_sensitive_paths() -> None:
         ".git",
         ".venv-win",
         ".venv-linux",
+        ".venv-macos",
         "**/__pycache__",
         "**/.pytest_cache",
         "**/.mypy_cache",
@@ -491,6 +691,14 @@ def test_dockerignore_excludes_repository_only_and_sensitive_paths() -> None:
         ".env",
         ".env.*",
         "!*.example",
+        ".codex",
+        "docs",
+        "tests",
+        "scripts",
+        "AGENTS.md",
+        ".gitlab-ci.yml",
+        "*.out",
+        "*.err",
     } <= rules
 
 
@@ -524,7 +732,34 @@ def test_repository_has_no_requirements_manifest_or_plain_venv_contract() -> Non
     requirements_files = [
         path.relative_to(ROOT)
         for path in ROOT.rglob("requirements*.txt")
-        if not {".venv-win", ".venv-linux"}.intersection(path.relative_to(ROOT).parts)
+        if not {".venv-win", ".venv-linux", ".venv-macos"}.intersection(
+            path.relative_to(ROOT).parts
+        )
     ]
     assert requirements_files == []
     assert not (ROOT / ".venv").exists()
+
+
+def test_security_scan_excludes_virtual_environments_and_build_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts import security_scan
+
+    monkeypatch.setattr(security_scan, "ROOT", tmp_path)
+    (tmp_path / ".dockerignore").write_text(
+        ".env\n.env.*\n**/.env\n**/.env.*\n",
+        encoding="utf-8",
+    )
+    for relative_path in (
+        ".venv-win/package.py",
+        ".venv-linux/package.py",
+        ".venv-macos/package.py",
+        "build/package.py",
+        "dist/package.py",
+        "sample.egg-info/metadata.py",
+    ):
+        path = tmp_path / relative_path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("API_KEY = 'sk-' + 'placeholder'\n", encoding="utf-8")
+
+    assert security_scan.scan() == []

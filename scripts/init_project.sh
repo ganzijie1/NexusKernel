@@ -8,24 +8,31 @@ case "${OSTYPE:-}" in
         ;;
 esac
 
-script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+script_path="${BASH_SOURCE[0]}"
+script_dir="${script_path%/*}"
+[[ "$script_dir" != "$script_path" ]] || script_dir="."
+script_dir="$(cd -- "$script_dir" && pwd -P)"
+version_checker="$script_dir/check_python_version.py"
 
-is_python_311() {
-    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] == (3, 11) else 1)' \
-        >/dev/null 2>&1
+is_supported_python() {
+    "$1" "$version_checker" --quiet >/dev/null 2>&1
 }
+
+[[ -f "$version_checker" ]] \
+    || { printf 'Error: missing Python version checker\n' >&2; exit 1; }
 
 python_command=""
 if [[ -n "${PYTHON:-}" ]]; then
-    is_python_311 "$PYTHON" \
+    is_supported_python "$PYTHON" \
         || {
-            printf 'Error: PYTHON must be an executable Python 3.11 interpreter\n' >&2
+            printf 'Error: PYTHON must be an executable Python >=3.11,<3.14 interpreter\n' >&2
             exit 1
         }
     python_command="$PYTHON"
 else
-    for candidate in python3.11 python3 python; do
-        if command -v "$candidate" >/dev/null 2>&1 && is_python_311 "$candidate"; then
+    for candidate in python3 python python3.13 python3.12 python3.11; do
+        if command -v "$candidate" >/dev/null 2>&1 \
+            && is_supported_python "$candidate"; then
             python_command="$candidate"
             break
         fi
@@ -33,7 +40,7 @@ else
 fi
 
 if [[ -z "$python_command" ]]; then
-    printf 'Error: could not find an executable Python 3.11 interpreter\n' >&2
+    printf 'Error: could not find an executable Python >=3.11,<3.14 interpreter\n' >&2
     exit 1
 fi
 

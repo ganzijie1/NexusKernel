@@ -55,10 +55,10 @@ def _make_template(tmp_path: Path) -> Path:
         project / "README.md",
         """# NexusKernel Starter
 
-Distribution: nexuskernel-starter
-Environment: NEXUSKERNEL_API_KEY
-Package: nexuskernel
-NEXUSKERNEL_DEFAULT_PORT=8030
+Distribution: nexus-kernel-starter
+Environment: NEXUS_KERNEL_API_KEY
+Package: nexus_kernel
+NEXUS_KERNEL_DEFAULT_PORT=8030
 Historical example: 8030
 CLI example: --port 8030
 Local URL: http://127.0.0.1:8030
@@ -69,31 +69,31 @@ Embedded display text: BeforeNexusKernel StarterAfter
     _write(
         project / "pyproject.toml",
         """[project]
-name = "nexuskernel-starter"
+name = "nexus-kernel-starter"
 
 [tool.setuptools.packages.find]
-include = ["nexuskernel*"]
+include = ["nexus_kernel*"]
 """,
     )
     _write(
         project / "config/settings.yaml",
         """service:
   name: NexusKernel Starter
-  env_prefix: NEXUSKERNEL
+  env_prefix: NEXUS_KERNEL
   port: 8030
   sample_year: 8030
 """,
     )
     _write(
         project / "docker/Dockerfile",
-        "ENV NEXUSKERNEL_DEFAULT_PORT=8030\nEXPOSE 8030\n",
+        "ENV NEXUS_KERNEL_DEFAULT_PORT=8030\nEXPOSE 8030\n",
     )
     _write(
         project / "docker/docker-compose-dev.yml",
         """services:
   api:
     ports:
-      - "${NEXUSKERNEL_PORT:-8030}:${NEXUSKERNEL_PORT:-8030}"
+      - "${NEXUS_KERNEL_PORT:-8030}:${NEXUS_KERNEL_PORT:-8030}"
       - "${OTHER_PORT:-8030}:8030"
     labels:
       sample-port: "8030"
@@ -101,43 +101,50 @@ include = ["nexuskernel*"]
     )
     _write(
         project / "docker/.env.example",
-        """NEXUSKERNEL_DEFAULT_PORT=8030
-NEXUSKERNEL_PORT=8030
-NEXUSKERNEL_API_KEY=
+        """NEXUS_KERNEL_DEFAULT_PORT=8030
+NEXUS_KERNEL_PORT=8030
+NEXUS_KERNEL_API_KEY=
 """,
     )
     _write(
         project / "docker/.env.dev.example",
-        """NEXUSKERNEL_DEFAULT_PORT=8030
-NEXUSKERNEL_PORT=8030
-NEXUSKERNEL_API_KEY=
+        """NEXUS_KERNEL_DEFAULT_PORT=8030
+NEXUS_KERNEL_PORT=8030
+NEXUS_KERNEL_API_KEY=
 DATABASE_URL=${DATABASE_URL:-}
 HOST=localhost
 """,
     )
     _write(
         project / "docker/other.example",
-        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
+        "NexusKernel Starter nexus-kernel-starter NEXUS_KERNEL 8030\n",
     )
     _write(
         project / "docker/README.md",
-        "Run NexusKernel Starter with NEXUSKERNEL_DEFAULT_PORT=8030.\n",
+        "Run NexusKernel Starter with NEXUS_KERNEL_DEFAULT_PORT=8030.\n",
     )
     _write(
         project / ".gitlab-ci.yml",
-        'variables:\n  NEXUSKERNEL_DEFAULT_PORT: "8030"\n',
+        """variables:
+  NEXUS_KERNEL_DEFAULT_PORT: "8030"
+
+container-smoke:
+  script:
+    - docker run -e NEXUS_KERNEL_PORT="$NEXUS_KERNEL_DEFAULT_PORT" -p "$NEXUS_KERNEL_DEFAULT_PORT:$NEXUS_KERNEL_DEFAULT_PORT" image
+    - curl "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live"
+""",
     )
     _write(
         project / "docs/guide/nested.md",
-        "NexusKernel Starter uses nexuskernel-starter and NEXUSKERNEL.\n",
+        "NexusKernel Starter uses nexus-kernel-starter and NEXUS_KERNEL.\n",
     )
     _write(
         project / "docs/superpowers/plans/review.md",
-        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
+        "NexusKernel Starter nexus-kernel-starter NEXUS_KERNEL 8030\n",
     )
     _write(
         project / "docs/superpowers/specs/review.md",
-        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
+        "NexusKernel Starter nexus-kernel-starter NEXUS_KERNEL 8030\n",
     )
     _write(
         project / "scripts/untouched.py",
@@ -145,11 +152,11 @@ HOST=localhost
     )
     _write(
         project / "tests/untouched.md",
-        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
+        "NexusKernel Starter nexus-kernel-starter NEXUS_KERNEL 8030\n",
     )
     _write(
         project / "outside-whitelist.txt",
-        "NexusKernel Starter nexuskernel-starter NEXUSKERNEL 8030\n",
+        "NexusKernel Starter nexus-kernel-starter NEXUS_KERNEL 8030\n",
     )
     binary_doc = project / "docs/binary.md"
     binary_doc.parent.mkdir(parents=True, exist_ok=True)
@@ -230,6 +237,7 @@ def _load_initializer(project: Path) -> ModuleType:
 def test_initializer_entry_points_exist() -> None:
     assert PYTHON_INITIALIZER.is_file(), "missing scripts/init_project.py"
     assert BASH_INITIALIZER.is_file(), "missing scripts/init_project.sh"
+    assert (ROOT / "scripts/check_python_version.py").is_file()
 
 
 def test_bash_entry_point_is_strict_and_only_delegates_to_python() -> None:
@@ -237,11 +245,16 @@ def test_bash_entry_point_is_strict_and_only_delegates_to_python() -> None:
     source = BASH_INITIALIZER.read_text(encoding="utf-8")
 
     assert "set -euo pipefail" in source
-    assert all(candidate in source for candidate in ("python3.11", "python3", "python"))
+    assert all(
+        candidate in source
+        for candidate in ("python3", "python", "python3.13", "python3.12", "python3.11")
+    )
     assert "${PYTHON:-}" in source
+    assert "check_python_version.py" in source
     assert 'PATH="/usr/bin:/bin${PATH:+:$PATH}"' in source
     assert "init_project.py" in source
     assert '"$@"' in source
+    assert "dirname" not in source
     assert "venv" not in source.lower()
 
     environment = os.environ.copy()
@@ -285,13 +298,14 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     generated_base_env = (template / "docker/.env").read_text(encoding="utf-8")
     generated_env = (template / "docker/.env.dev").read_text(encoding="utf-8")
     nested_doc = (template / "docs/guide/nested.md").read_text(encoding="utf-8")
+    pipeline = (template / ".gitlab-ci.yml").read_text(encoding="utf-8")
     marker = json.loads(
-        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+        (template / ".nexus-kernel-initialized").read_text(encoding="utf-8")
     )
 
     assert "# Acme Intelligence" in readme
     assert "acme-intelligence" in readme and "ACME_AI_API_KEY" in readme
-    assert "NEXUSKERNEL_DEFAULT_PORT=8030" not in readme
+    assert "NEXUS_KERNEL_DEFAULT_PORT=8030" not in readme
     assert "ACME_AI_DEFAULT_PORT=9123" in readme
     assert "Historical example: 8030" in readme
     assert "CLI example: --port 9123" in readme
@@ -299,7 +313,7 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     assert "Unrelated assignment: OTHER_DEFAULT_PORT=8030" in readme
     assert "Embedded display text: BeforeNexusKernel StarterAfter" in readme
     assert 'name = "acme-intelligence"' in pyproject
-    assert 'include = ["nexuskernel*"]' in pyproject
+    assert 'include = ["nexus_kernel*"]' in pyproject
     assert "  port: 9123" in config
     assert "  sample_year: 8030" in config
     assert "${ACME_AI_PORT:-9123}:${ACME_AI_PORT:-9123}" in compose
@@ -313,7 +327,11 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     assert "ACME_AI_PORT=9123" in generated_env
     assert "ACME_AI_API_KEY=" in generated_env
     assert "Acme Intelligence" in nested_doc
-    assert "nexuskernel" in readme
+    assert 'ACME_AI_DEFAULT_PORT: "9123"' in pipeline
+    assert "$ACME_AI_DEFAULT_PORT" in pipeline
+    assert "NEXUS_KERNEL" not in pipeline
+    assert "8030" not in pipeline
+    assert "nexus_kernel" in readme
     assert (template / "docs/binary.md").read_bytes().startswith(b"\xff\x00")
     assert marker == {
         "name": "Acme Intelligence",
@@ -359,7 +377,7 @@ def test_name_rejects_every_splitlines_separator(
 def test_inserted_name_is_not_reprocessed_as_an_env_prefix(template: Path) -> None:
     arguments = (
         "--name",
-        "NEXUSKERNEL Console",
+        "NEXUS_KERNEL Console",
         "--slug",
         "acme-console",
         "--env-prefix",
@@ -371,13 +389,13 @@ def test_inserted_name_is_not_reprocessed_as_an_env_prefix(template: Path) -> No
     result = _run_initializer(template, arguments)
 
     assert result.returncode == 0, result.stderr
-    assert "# NEXUSKERNEL Console" in (template / "README.md").read_text(
+    assert "# NEXUS_KERNEL Console" in (template / "README.md").read_text(
         encoding="utf-8"
     )
     marker = json.loads(
-        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+        (template / ".nexus-kernel-initialized").read_text(encoding="utf-8")
     )
-    assert marker["name"] == "NEXUSKERNEL Console"
+    assert marker["name"] == "NEXUS_KERNEL Console"
 
 
 @pytest.mark.parametrize(
@@ -391,7 +409,7 @@ def test_safe_english_and_chinese_names_initialize(template: Path, name: str) ->
 
     assert result.returncode == 0, result.stderr
     marker = json.loads(
-        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+        (template / ".nexus-kernel-initialized").read_text(encoding="utf-8")
     )
     assert marker["name"] == name
 
@@ -477,8 +495,8 @@ def test_yaml_implicit_scalar_names_are_rejected_after_trim_and_casefold(
     ("token", "replacement"),
     [
         ("NexusKernel Starter", "Alternate Starter"),
-        ("nexuskernel-starter", "alternate-starter"),
-        ("NEXUSKERNEL", "ALTERNATE"),
+        ("nexus-kernel-starter", "alternate-starter"),
+        ("NEXUS_KERNEL", "ALTERNATE"),
         ("8030", "8031"),
     ],
     ids=("display-name", "slug", "env-prefix", "port"),
@@ -494,7 +512,7 @@ def test_missing_default_token_is_rejected_before_writes(
     assert result.returncode != 0
     assert "template" in result.stderr.lower()
     assert _snapshot(template) == before
-    assert not (template / ".nexuskernel-initialized").exists()
+    assert not (template / ".nexus-kernel-initialized").exists()
 
 
 @pytest.mark.parametrize("port", [1, 65535])
@@ -505,7 +523,7 @@ def test_port_boundaries_initialize_successfully(template: Path, port: int) -> N
 
     assert result.returncode == 0, result.stderr
     marker = json.loads(
-        (template / ".nexuskernel-initialized").read_text(encoding="utf-8")
+        (template / ".nexus-kernel-initialized").read_text(encoding="utf-8")
     )
     assert marker["port"] == port
     assert f"  port: {port}" in (template / "config/settings.yaml").read_text(
@@ -610,7 +628,7 @@ def test_second_execution_is_rejected_without_changes(template: Path) -> None:
 
 
 def test_existing_lock_is_preserved_and_rejected_without_writes(template: Path) -> None:
-    lock = template / ".nexuskernel-init.lock"
+    lock = template / ".nexus-kernel-init.lock"
     lock.write_text("external-owner\n", encoding="utf-8")
     before = _snapshot(template)
 
@@ -637,7 +655,7 @@ def test_lock_contains_pid_uses_private_mode_and_is_removed(
         *,
         dir_fd: int | None = None,
     ) -> int:
-        if Path(path).name == ".nexuskernel-init.lock":
+        if Path(path).name == ".nexus-kernel-init.lock":
             observed["flags"] = flags
             observed["mode"] = mode
         if dir_fd is None:
@@ -645,7 +663,7 @@ def test_lock_contains_pid_uses_private_mode_and_is_removed(
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
     def inspect_plan(root: Path, identity: object) -> object:
-        lock = root / ".nexuskernel-init.lock"
+        lock = root / ".nexus-kernel-init.lock"
         observed["pid"] = lock.read_text(encoding="ascii").strip()
         return real_plan(root, identity)
 
@@ -664,7 +682,7 @@ def test_lock_contains_pid_uses_private_mode_and_is_removed(
     assert observed["flags"] & os.O_EXCL
     assert observed["mode"] == 0o600
     assert observed["pid"] == str(os.getpid())
-    assert not (template / ".nexuskernel-init.lock").exists()
+    assert not (template / ".nexus-kernel-init.lock").exists()
 
 
 @pytest.mark.parametrize("real_env", ["docker/.env", "docker/.env.dev"])
@@ -679,14 +697,14 @@ def test_existing_real_env_is_rejected_without_any_write(
     assert result.returncode != 0
     assert real_env in result.stderr.replace("\\", "/")
     assert _snapshot(template) == before
-    assert not (template / ".nexuskernel-initialized").exists()
+    assert not (template / ".nexus-kernel-initialized").exists()
 
 
 @pytest.mark.parametrize(
     ("race_target", "external_content"),
     [
         ("docker/.env", "EXTERNAL_ENV=value\n"),
-        (".nexuskernel-initialized", "external marker\n"),
+        (".nexus-kernel-initialized", "external marker\n"),
     ],
 )
 def test_generated_target_race_preserves_external_target_and_rolls_back(
@@ -722,7 +740,7 @@ def test_generated_target_race_preserves_external_target_and_rolls_back(
     after = _snapshot(template)
     assert after.pop(race_target)[0] == external_content.encode()
     assert after == before
-    assert not (template / ".nexuskernel-init.lock").exists()
+    assert not (template / ".nexus-kernel-init.lock").exists()
 
 
 def test_replace_failure_before_call_does_not_restore_attempted_target(
@@ -757,7 +775,7 @@ def test_replace_failure_before_call_does_not_restore_attempted_target(
     assert readme.read_bytes() == before_content
     assert stat.S_IMODE(readme.stat().st_mode) == before_mode
     assert readme.stat().st_mtime_ns == fixed_timestamp
-    assert not (template / ".nexuskernel-init.lock").exists()
+    assert not (template / ".nexus-kernel-init.lock").exists()
 
 
 def test_replace_failure_restores_files_env_and_marker(
@@ -789,9 +807,9 @@ def test_replace_failure_restores_files_env_and_marker(
     assert _snapshot(template) == before
     assert not (template / "docker/.env").exists()
     assert not (template / "docker/.env.dev").exists()
-    assert not (template / ".nexuskernel-initialized").exists()
+    assert not (template / ".nexus-kernel-initialized").exists()
     assert not list(template.rglob("*.tmp"))
-    assert not (template / ".nexuskernel-init.lock").exists()
+    assert not (template / ".nexus-kernel-init.lock").exists()
 
 
 def test_modified_file_modes_are_preserved(template: Path) -> None:
@@ -830,7 +848,7 @@ def test_generated_env_and_marker_are_planned_with_private_modes(
 
     assert modes["docker/.env"] == 0o600
     assert modes["docker/.env.dev"] == 0o600
-    assert modes[".nexuskernel-initialized"] == 0o600
+    assert modes[".nexus-kernel-initialized"] == 0o600
 
 
 def test_non_whitelisted_files_are_never_modified(template: Path) -> None:

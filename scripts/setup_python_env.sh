@@ -12,10 +12,10 @@ usage() {
     cat <<'EOF'
 Usage: scripts/setup_python_env.sh [OPTIONS]
 
-Create or reuse the project Python 3.11 virtual environment and install .[ai,dev].
+Create or reuse a project Python 3.11-3.13 virtual environment and install .[ai,dev].
 
 Options:
-  --python PATH  Python 3.11 interpreter used to create the environment.
+  --python PATH  Supported Python interpreter used to create the environment.
   --recreate     Safely replace an existing project environment.
   --help         Show this help message.
 EOF
@@ -26,7 +26,7 @@ fail() {
     exit 1
 }
 
-python_command="python"
+python_command=""
 recreate=false
 
 while (($# > 0)); do
@@ -57,6 +57,9 @@ done
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 project_root="$(cd -- "$script_dir/.." && pwd -P)"
+version_checker="$script_dir/check_python_version.py"
+
+[[ -f "$version_checker" ]] || fail "missing Python version checker: $version_checker"
 
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
@@ -64,6 +67,9 @@ case "$(uname -s)" in
         ;;
     Linux*)
         environment_name=".venv-linux"
+        ;;
+    Darwin*)
+        environment_name=".venv-macos"
         ;;
     *)
         fail "unsupported platform: $(uname -s)"
@@ -87,10 +93,6 @@ find_venv_python() {
     done
 
     return 1
-}
-
-python_minor_version() {
-    "$1" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")'
 }
 
 validate_venv() {
@@ -117,7 +119,7 @@ safe_remove_environment() {
     canonical_target="$target_parent/$(basename -- "$target")"
 
     case "$canonical_target" in
-        "$project_root/.venv-win"|"$project_root/.venv-linux")
+        "$project_root/.venv-win"|"$project_root/.venv-linux"|"$project_root/.venv-macos")
             ;;
         *)
             fail "refusing to remove unsafe environment path: $canonical_target"
@@ -129,30 +131,35 @@ safe_remove_environment() {
 
 create_environment=true
 if [[ -e "$environment_dir" ]]; then
-    if [[ "$recreate" == true ]]; then
-        source_version="$(python_minor_version "$python_command")" \
-            || fail "cannot run Python interpreter: $python_command"
-        [[ "$source_version" == "3.11" ]] \
-            || fail "Python 3.11 is required; found $source_version"
-        safe_remove_environment "$environment_dir"
-    else
+    if [[ "$recreate" == false ]]; then
         environment_python="$(find_venv_python "$environment_dir")" \
             || fail "existing environment is invalid; rerun with --recreate"
         validate_venv "$environment_python" "$environment_dir" \
             || fail "existing environment is invalid; rerun with --recreate"
-        environment_version="$(python_minor_version "$environment_python")" \
-            || fail "existing environment is invalid; rerun with --recreate"
-        [[ "$environment_version" == "3.11" ]] \
-            || fail "existing environment uses Python $environment_version; rerun with --recreate"
+        "$environment_python" "$version_checker" --quiet \
+            || fail "existing environment uses unsupported Python; rerun with --recreate"
         create_environment=false
     fi
 fi
 
 if [[ "$create_environment" == true ]]; then
-    source_version="${source_version:-$(python_minor_version "$python_command")}" \
-        || fail "cannot run Python interpreter: $python_command"
-    [[ "$source_version" == "3.11" ]] \
-        || fail "Python 3.11 is required; found $source_version"
+    if [[ -z "$python_command" ]]; then
+        for candidate in python3 python python3.13 python3.12 python3.11; do
+            if command -v "$candidate" >/dev/null 2>&1 \
+                && "$candidate" "$version_checker" --quiet; then
+                python_command="$candidate"
+                break
+            fi
+        done
+        [[ -n "$python_command" ]] \
+            || fail "could not find Python >=3.11,<3.14"
+    fi
+
+    "$python_command" "$version_checker" --quiet \
+        || fail "Python >=3.11,<3.14 is required"
+    if [[ -e "$environment_dir" ]]; then
+        safe_remove_environment "$environment_dir"
+    fi
     "$python_command" -m venv "$environment_dir"
     environment_python="$(find_venv_python "$environment_dir")" \
         || fail "created environment does not contain an executable Python interpreter"

@@ -13,11 +13,11 @@ from typing import NoReturn, Sequence
 
 
 DEFAULT_NAME = "NexusKernel Starter"
-DEFAULT_SLUG = "nexuskernel-starter"
-DEFAULT_ENV_PREFIX = "NEXUSKERNEL"
+DEFAULT_SLUG = "nexus-kernel-starter"
+DEFAULT_ENV_PREFIX = "NEXUS_KERNEL"
 DEFAULT_PORT = "8030"
-MARKER_NAME = ".nexuskernel-initialized"
-LOCK_NAME = ".nexuskernel-init.lock"
+MARKER_NAME = ".nexus-kernel-initialized"
+LOCK_NAME = ".nexus-kernel-init.lock"
 MAX_NAME_LENGTH = 80
 
 _SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -50,12 +50,17 @@ _DEFAULT_ENV_PREFIX_RE = re.compile(
 )
 _ENV_EXAMPLE_RE = re.compile(r"^\.env(?:\.[A-Za-z0-9_-]+)?\.example$")
 
-_DISPLAY_NAME_TOKEN = "display name"
-_SLUG_TOKEN = "slug"
-_ENV_PREFIX_TOKEN = "env prefix"
-_PORT_TOKEN = "port"
-_REQUIRED_TEMPLATE_TOKENS = frozenset(
-    {_DISPLAY_NAME_TOKEN, _SLUG_TOKEN, _ENV_PREFIX_TOKEN, _PORT_TOKEN}
+_DISPLAY_NAME_PLACEHOLDER = "display name"
+_SLUG_PLACEHOLDER = "slug"
+_ENV_PREFIX_PLACEHOLDER = "env prefix"
+_PORT_PLACEHOLDER = "port"
+_REQUIRED_TEMPLATE_PLACEHOLDERS = frozenset(
+    {
+        _DISPLAY_NAME_PLACEHOLDER,
+        _SLUG_PLACEHOLDER,
+        _ENV_PREFIX_PLACEHOLDER,
+        _PORT_PLACEHOLDER,
+    }
 )
 
 
@@ -266,44 +271,44 @@ def _transform_text(
 
     def replace(match: re.Match[str]) -> str:
         if match.group("port_assignment") is not None:
-            hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
+            hits.update({_ENV_PREFIX_PLACEHOLDER, _PORT_PLACEHOLDER})
             return f"{identity.env_prefix}{match.group('assignment_middle')}{port}"
         if match.group("port_yaml_key") is not None:
-            hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
+            hits.update({_ENV_PREFIX_PLACEHOLDER, _PORT_PLACEHOLDER})
             return (
                 f"{match.group('yaml_key_indent')}{identity.env_prefix}"
                 f"{match.group('yaml_key_middle')}{match.group('yaml_key_open_quote')}"
                 f"{port}{match.group('yaml_key_close_quote')}"
             )
         if "compose_port" in match.re.groupindex and match.group("compose_port"):
-            hits.update({_ENV_PREFIX_TOKEN, _PORT_TOKEN})
+            hits.update({_ENV_PREFIX_PLACEHOLDER, _PORT_PLACEHOLDER})
             return f"${{{identity.env_prefix}_PORT:-{port}}}"
         if "docker_expose" in match.re.groupindex and match.group("docker_expose"):
-            hits.add(_PORT_TOKEN)
+            hits.add(_PORT_PLACEHOLDER)
             return (
                 f"{match.group('docker_expose_prefix')}{port}"
                 f"{match.group('docker_expose_suffix')}"
             )
         if "readme_cli_port" in match.re.groupindex and match.group("readme_cli_port"):
-            hits.add(_PORT_TOKEN)
+            hits.add(_PORT_PLACEHOLDER)
             return f"{match.group('readme_cli_prefix')}{port}"
         if "readme_url_port" in match.re.groupindex and match.group("readme_url_port"):
-            hits.add(_PORT_TOKEN)
+            hits.add(_PORT_PLACEHOLDER)
             return f"{match.group('readme_url_prefix')}{port}"
         if "yaml_port" in match.re.groupindex and match.group("yaml_port"):
-            hits.add(_PORT_TOKEN)
+            hits.add(_PORT_PLACEHOLDER)
             return (
                 f"{match.group('yaml_port_prefix')}{match.group('yaml_port_open_quote')}"
                 f"{port}{match.group('yaml_port_close_quote')}"
                 f"{match.group('yaml_port_suffix')}"
             )
         if match.group("display_name") is not None:
-            hits.add(_DISPLAY_NAME_TOKEN)
+            hits.add(_DISPLAY_NAME_PLACEHOLDER)
             return identity.name
         if match.group("slug") is not None:
-            hits.add(_SLUG_TOKEN)
+            hits.add(_SLUG_PLACEHOLDER)
             return identity.slug
-        hits.add(_ENV_PREFIX_TOKEN)
+        hits.add(_ENV_PREFIX_PLACEHOLDER)
         return identity.env_prefix
 
     transformed = _replacement_pattern(relative_path).sub(replace, text)
@@ -335,7 +340,7 @@ def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
     files = _discover_whitelist(root)
     originals: dict[Path, tuple[bytes, int]] = {}
     transformed: dict[Path, bytes] = {}
-    template_tokens: set[str] = set()
+    template_placeholders: set[str] = set()
 
     for path in files:
         content = path.read_bytes()
@@ -353,14 +358,14 @@ def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
         transformed_text, hits = _transform_text(
             text, _relative_display(root, path), identity
         )
-        template_tokens.update(hits)
+        template_placeholders.update(hits)
         transformed[path] = transformed_text.encode("utf-8")
 
-    missing_tokens = _REQUIRED_TEMPLATE_TOKENS - template_tokens
-    if missing_tokens:
+    missing_placeholders = _REQUIRED_TEMPLATE_PLACEHOLDERS - template_placeholders
+    if missing_placeholders:
         _fail(
             "template is missing required default token(s): "
-            + ", ".join(sorted(missing_tokens))
+            + ", ".join(sorted(missing_placeholders))
         )
 
     generated: list[tuple[Path, bytes, int]] = []

@@ -1,6 +1,7 @@
 # Python environments
 .venv-win/
 .venv-linux/
+.venv-macos/
 
 # Python and tool caches
 __pycache__/
@@ -19,6 +20,8 @@ dist/
 
 # Logs
 *.log
+*.out
+*.err
 logs/
 
 # Local environment and credentials

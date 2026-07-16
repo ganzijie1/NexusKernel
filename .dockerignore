@@ -2,6 +2,7 @@
 .gitignore
 .venv-win
 .venv-linux
+.venv-macos
 **/__pycache__
 **/*.py[cod]
 **/.pytest_cache
@@ -14,7 +15,15 @@ build
 dist
 *.egg-info
 *.log
+*.out
+*.err
 logs
+.codex
+docs
+tests
+scripts
+AGENTS.md
+.gitlab-ci.yml
 .env
 .env.*
 !*.example
