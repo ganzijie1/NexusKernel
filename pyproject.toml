@@ -1,13 +1,13 @@
 [build-system]
-requires = ["setuptools>=75.0.0"]
+requires = ["setuptools==83.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nexuskernel-starter"
-version = "0.1.0"
+name = "nexus-kernel-starter"
+version = "0.2.0"
 description = "A reusable modular AI service foundation."
 readme = "README.md"
-requires-python = ">=3.11,<3.12"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     "fastapi==0.139.0",
     "uvicorn[standard]==0.51.0",
@@ -16,6 +16,7 @@ dependencies = [
     "prometheus-client==0.25.0",
     "loguru==0.7.3",
     "httpx==0.28.1",
+    "jsonschema==4.26.0",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +33,10 @@ otel = [
     "opentelemetry-sdk==1.41.1",
     "opentelemetry-exporter-otlp-proto-grpc==1.41.1",
 ]
+postgres = ["asyncpg==0.31.0"]
 dev = [
+    "build==1.5.1",
+    "packaging==26.2",
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "ruff==0.15.21",
@@ -43,7 +47,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["nexuskernel*", "app*"]
+include = ["nexus_kernel*", "app*"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -53,7 +57,13 @@ markers = ["real_llm: explicitly enabled real-model smoke tests"]
 [tool.ruff]
 target-version = "py311"
 
+[tool.ruff.lint]
+extend-select = ["C90"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 18
+
 [tool.mypy]
 python_version = "3.11"
-files = ["app", "nexuskernel"]
+files = ["app", "nexus_kernel"]
 strict = true

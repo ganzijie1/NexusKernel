@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from nexuskernel.runtime import Event, EventBus
+from nexus_kernel.runtime import Event, EventBus
 
 
 @pytest.mark.asyncio
@@ -38,7 +38,9 @@ async def test_event_bus_aggregates_safe_handler_errors() -> None:
 
     bus.subscribe("created", broken)
 
-    errors = await bus.publish(Event("created", {"secret": "must-not-leak"}))
+    errors = await bus.publish(
+        Event("created", {"secret": "must-not-leak"})  # security-test-fixture
+    )
 
     assert errors == ["event_handler_failed:created:0"]
     assert "must-not-leak" not in repr(errors)

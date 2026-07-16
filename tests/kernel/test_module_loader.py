@@ -1,24 +1,32 @@
 from __future__ import annotations
 
 import sys
+import traceback
 from types import ModuleType
-from typing import Protocol
+from typing import Any, Protocol
 
 import pytest
+from pydantic import ValidationError
 
-from nexuskernel.config import ModulesSettings
-from nexuskernel.errors import ConfigError
-from nexuskernel.kernel import (
+from nexus_kernel.config import ModulesSettings
+from nexus_kernel.errors import ConfigError, ModuleDependencyError
+from nexus_kernel.kernel import (
     HttpEndpointSpec,
     Module,
+    ModuleConfig,
+    ModuleContext,
     ModuleState,
-    ProviderState,
     load_modules,
 )
 
 
+class GoodModuleConfig(ModuleConfig):
+    limit: int = 4
+
+
 class GoodModule(Module):
     name = "good"
+    config_schema = GoodModuleConfig
 
 
 class OtherNameModule(Module):
@@ -32,11 +40,21 @@ class BrokenConstructorModule(Module):
         raise RuntimeError("constructor leaked secret-token")
 
 
+class MissingApi(Protocol):
+    def missing(self) -> str: ...
+
+
+class MissingApiModule(Module):
+    name = "missing_api"
+    api_contract = MissingApi
+
+
 def _plugin_module() -> ModuleType:
     plugin = ModuleType("test_module_plugin")
     plugin.GoodModule = GoodModule
     plugin.OtherNameModule = OtherNameModule
     plugin.BrokenConstructorModule = BrokenConstructorModule
+    plugin.MissingApiModule = MissingApiModule
     plugin.NotAModule = object
     return plugin
 
@@ -58,7 +76,7 @@ def test_loader_skips_disabled_modules_and_preserves_declaration_order(
             "good": {
                 "class": "test_module_plugin.GoodModule",
                 "required": False,
-                "config": {"nested": {"secret": "redact-me"}, "limit": 4},
+                "config": {"limit": 4},
             },
         }
     )
@@ -69,32 +87,52 @@ def test_loader_skips_disabled_modules_and_preserves_declaration_order(
         (item.module.name, item.required, item.original_index) for item in loaded
     ] == [("good", False, 1)]
     assert loaded[0].module.state is ModuleState.CREATED
-    assert loaded[0].module.config.get("limit") == 4
-    assert loaded[0].module.config.get("nested.secret") == "redact-me"
+    assert loaded[0].module.config.limit == 4
+    assert isinstance(loaded[0].module.config, GoodModuleConfig)
 
 
-def test_bound_module_config_is_read_only_and_returns_defensive_copies(
+def test_module_config_is_strict_frozen_and_rejects_unknown_fields(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
-    source = {"nested": {"value": 1}}
     module = load_modules(
         _settings(
             {
                 "good": {
                     "class": "test_module_plugin.GoodModule",
-                    "config": source,
+                    "config": {"limit": 7},
                 }
             }
         )
     )[0].module
 
-    source["nested"]["value"] = 2
-    exported = module.config.to_dict()
-    exported["nested"]["value"] = 3
+    assert module.config.limit == 7
+    with pytest.raises(ValidationError):
+        module.config.limit = 8
 
-    assert module.config.get("nested.value") == 1
-    assert not hasattr(module.config, "set")
+    with pytest.raises(ConfigError):
+        load_modules(
+            _settings(
+                {
+                    "good": {
+                        "class": "test_module_plugin.GoodModule",
+                        "config": {"limit": "7"},
+                    }
+                }
+            )
+        )
+
+    with pytest.raises(ConfigError):
+        load_modules(
+            _settings(
+                {
+                    "good": {
+                        "class": "test_module_plugin.GoodModule",
+                        "config": {"unknown": True},
+                    }
+                }
+            )
+        )
 
 
 @pytest.mark.parametrize(
@@ -113,14 +151,30 @@ def test_loader_normalizes_module_failures_without_leaking_config(
     definition: dict[str, object],
 ) -> None:
     monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
-    definition["config"] = {"password": "do-not-leak"}
+    definition["config"] = {"password": "do-not-leak"}  # security-test-fixture
 
     with pytest.raises(ConfigError) as captured:
         load_modules(_settings({module_name: definition}))
 
-    assert captured.value.__cause__ is not None
+    rendered = "".join(traceback.format_exception(captured.value))
+    assert captured.value.__cause__ is None
+    assert captured.value.__suppress_context__ is True
     assert "do-not-leak" not in str(captured.value)
-    assert "secret-token" not in str(captured.value)
+    assert "secret-token" not in rendered
+
+
+def test_loader_rejects_missing_protocol_implementation_as_config_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
+
+    with pytest.raises(ConfigError) as captured:
+        load_modules(
+            _settings({"missing_api": {"class": "test_module_plugin.MissingApiModule"}})
+        )
+
+    assert not isinstance(captured.value, AttributeError)
+    assert "has no attribute" not in str(captured.value)
 
 
 class BaseApi(Protocol):
@@ -147,38 +201,113 @@ class ContractModule(Module):
     optional_provider_names = ("cache",)
 
 
-def test_module_contract_walks_protocol_mro_and_delegates_dependency() -> None:
-    dependency = object()
-
-    class KernelProbe:
-        def __init__(self) -> None:
-            self.requested: list[str] = []
-
-        def get_module(self, name: str) -> object:
-            self.requested.append(name)
-            return dependency
-
-    kernel = KernelProbe()
+def test_module_contract_walks_protocol_mro() -> None:
     module = ContractModule()
-    module.bind_kernel(kernel)
 
     assert module.get_api_contract() == ["base", "shared", "child"]
-    assert module.get_dependency("required-module") is dependency
-    assert kernel.requested == ["required-module"]
+    assert not hasattr(module, "bind_kernel")
+    assert not hasattr(module, "get_dependency")
+    assert not hasattr(module, "get_provider")
+
+
+def test_module_context_enforces_declared_capabilities() -> None:
+    requested: list[tuple[str, str]] = []
+    resources = {
+        ("module", "required-module"): object(),
+        ("module", "optional-module"): object(),
+        ("provider", "database"): object(),
+        ("provider", "cache"): object(),
+    }
+    context = ModuleContext._create(
+        module_name="contract",
+        required_modules=("required-module",),
+        optional_modules=("optional-module",),
+        required_providers=("database",),
+        optional_providers=("cache",),
+        module_resolver=lambda name: (
+            requested.append(("module", name)) or resources[("module", name)]
+        ),
+        optional_module_resolver=lambda name: (
+            requested.append(("module", name)) or resources.get(("module", name))
+        ),
+        provider_resolver=lambda name: (
+            requested.append(("provider", name)) or resources[("provider", name)]
+        ),
+        optional_provider_resolver=lambda name: (
+            requested.append(("provider", name)) or resources.get(("provider", name))
+        ),
+    )
+
+    assert (
+        context.require_module("required-module")
+        is resources[("module", "required-module")]
+    )
+    assert (
+        context.optional_module("optional-module")
+        is resources[("module", "optional-module")]
+    )
+    assert context.require_provider("database") is resources[("provider", "database")]
+    assert context.optional_provider("cache") is resources[("provider", "cache")]
+    with pytest.raises(ModuleDependencyError, match="not declared"):
+        context.require_module("optional-module")
+    with pytest.raises(ModuleDependencyError, match="not declared"):
+        context.optional_provider("database")
+    assert not hasattr(context, "kernel")
+
+
+class ExactApi(Protocol):
+    def execute(self, value: str, *, retries: int = 1) -> str: ...
+
+
+class WrongParameterModule(Module):
+    name = "wrong_parameter"
+    api_contract = ExactApi
+
+    def execute(self, other: str, *, retries: int = 1) -> str:
+        return other
+
+
+class WrongDefaultModule(Module):
+    name = "wrong_default"
+    api_contract = ExactApi
+
+    def execute(self, value: str, *, retries: int) -> str:
+        return value
+
+
+class WrongAsyncApi(Protocol):
+    async def execute(self) -> str: ...
+
+
+class WrongAsyncModule(Module):
+    name = "wrong_async"
+    api_contract = WrongAsyncApi
+
+    def execute(self) -> str:
+        return "wrong"
+
+
+@pytest.mark.parametrize(
+    "module",
+    [WrongParameterModule(), WrongDefaultModule(), WrongAsyncModule()],
+)
+def test_module_protocol_validates_signature_and_async_shape(module: Module) -> None:
+    with pytest.raises(ModuleDependencyError, match="API implementation is invalid"):
+        module.validate_api_implementation()
 
 
 @pytest.mark.asyncio
 async def test_module_default_lifecycle_hooks_are_no_ops() -> None:
     module = Module()
 
-    assert module.on_register(object()) is None
-    assert await module.on_start(object()) is None
-    assert await module.on_stop(object()) is None
+    assert module.on_register(Any) is None
+    assert await module.on_start(Any) is None
+    assert await module.on_stop(Any) is None
+    assert module.get_worker_specs() == []
 
 
 def test_module_info_contains_only_public_metadata() -> None:
     module = ContractModule()
-    module.bind_config({"password": "never-expose"})
 
     info = module.get_info()
 
@@ -189,22 +318,13 @@ def test_module_info_contains_only_public_metadata() -> None:
     assert "config" not in info
 
 
-def test_module_and_provider_states_define_the_public_lifecycle() -> None:
+def test_module_states_define_the_public_lifecycle() -> None:
     assert [state.value for state in ModuleState] == [
         "created",
         "registered",
         "starting",
         "ready",
         "degraded",
-        "stopped",
-        "failed",
-    ]
-    assert [state.value for state in ProviderState] == [
-        "registered",
-        "starting",
-        "ready",
-        "degraded",
-        "disabled",
         "stopped",
         "failed",
     ]

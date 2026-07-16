@@ -5,12 +5,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from nexuskernel.config import (
+from nexus_kernel.config import (
     ApplicationSettings,
     load_application_settings,
     load_module_definitions,
 )
-from nexuskernel.errors import ConfigError
+from nexus_kernel.errors import ConfigError
 
 
 def _write(path: Path, content: str) -> Path:
@@ -48,6 +48,22 @@ def test_application_settings_requires_positive_runtime_limits(
 def test_application_settings_restricts_runtime_role() -> None:
     with pytest.raises(ValidationError):
         ApplicationSettings.model_validate({"runtime": {"role": "scheduler"}})
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("server", "port", "8030"),
+        ("server", "request_timeout_seconds", "30"),
+        ("runtime", "role", 1),
+        ("logging", "serialize", "false"),
+    ],
+)
+def test_application_settings_rejects_coerced_scalar_types(
+    section: str, field: str, value: object
+) -> None:
+    with pytest.raises(ValidationError):
+        ApplicationSettings.model_validate({section: {field: value}})
 
 
 def test_load_application_settings_resolves_recursive_environment_values(

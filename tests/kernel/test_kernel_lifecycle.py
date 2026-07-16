@@ -1,21 +1,63 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Protocol
+from typing import Protocol
 
 import pytest
 
-from nexuskernel.errors import (
+from nexus_kernel.errors import (
     KernelStartupError,
     ModuleAccessError,
     ModuleDependencyError,
     ModuleLookupError,
+    WorkerError,
 )
-from nexuskernel.kernel import Kernel, LoadedModule, Module, ModuleState
+from nexus_kernel.kernel import (
+    HttpEndpointSpec,
+    Kernel,
+    LoadedModule,
+    Module,
+    ModuleContext,
+    ModuleState,
+)
+from nexus_kernel.runtime import WorkerSpec
 
 
 def _loaded(module: Module, index: int, *, required: bool = True) -> LoadedModule:
     return LoadedModule(module=module, required=required, original_index=index)
+
+
+async def _idle_worker(stop_event: asyncio.Event) -> None:
+    await stop_event.wait()
+
+
+class WorkerModule(Module):
+    def __init__(self, name: str, specs: tuple[WorkerSpec, ...]) -> None:
+        super().__init__()
+        self.name = name
+        self._specs = specs
+
+    def get_worker_specs(self) -> list[WorkerSpec]:
+        return list(self._specs)
+
+
+@pytest.mark.asyncio
+async def test_kernel_aggregates_operational_worker_specs_in_stable_order() -> None:
+    second = WorkerModule("second", (WorkerSpec("worker_b", _idle_worker),))
+    first = WorkerModule("first", (WorkerSpec("worker_a", _idle_worker),))
+    kernel = Kernel([_loaded(second, 1), _loaded(first, 0)])
+
+    assert kernel.worker_specs() == []
+    await kernel.start()
+    assert [spec.name for spec in kernel.worker_specs()] == ["worker_a", "worker_b"]
+    await kernel.stop()
+
+
+def test_kernel_rejects_duplicate_worker_names_across_modules() -> None:
+    first = WorkerModule("first", (WorkerSpec("duplicate", _idle_worker),))
+    second = WorkerModule("second", (WorkerSpec("duplicate", _idle_worker),))
+    with pytest.raises(WorkerError, match="duplicated"):
+        Kernel([_loaded(first, 0), _loaded(second, 1)])
 
 
 class RecordingModule(Module):
@@ -39,20 +81,74 @@ class RecordingModule(Module):
         self.stop_error = stop_error
         self.block_start = block_start
 
-    def on_register(self, kernel: Any) -> None:
+    def on_register(self, context: ModuleContext) -> None:
         self.events.append(f"register:{self.name}")
 
-    async def on_start(self, kernel: Any) -> None:
+    async def on_start(self, context: ModuleContext) -> None:
         self.events.append(f"start:{self.name}")
         if self.block_start:
             await asyncio.sleep(60)
         if self.start_error is not None:
             raise self.start_error
 
-    async def on_stop(self, kernel: Any) -> None:
+    async def on_stop(self, context: ModuleContext) -> None:
         self.events.append(f"stop:{self.name}")
         if self.stop_error is not None:
             raise self.stop_error
+
+
+class ConcurrentStartModule(Module):
+    name = "concurrent_start"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_entered = asyncio.Event()
+        self.release_start = asyncio.Event()
+        self.register_count = 0
+        self.start_count = 0
+        self.stop_count = 0
+
+    def on_register(self, context: ModuleContext) -> None:
+        self.register_count += 1
+
+    async def on_start(self, context: ModuleContext) -> None:
+        self.start_count += 1
+        self.start_entered.set()
+        await self.release_start.wait()
+
+    async def on_stop(self, context: ModuleContext) -> None:
+        self.stop_count += 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_kernel_start_runs_lifecycle_once() -> None:
+    module = ConcurrentStartModule()
+    kernel = Kernel([_loaded(module, 0)])
+    first = asyncio.create_task(kernel.start())
+    await module.start_entered.wait()
+    second = asyncio.create_task(kernel.start())
+    await asyncio.sleep(0)
+
+    module.release_start.set()
+    await asyncio.gather(first, second)
+    await kernel.stop()
+
+    assert (module.register_count, module.start_count, module.stop_count) == (1, 1, 1)
+
+
+class CallableApi(Protocol):
+    def execute(self) -> str: ...
+
+
+class NonCallableApiModule(Module):
+    name = "non_callable_api"
+    api_contract = CallableApi
+    execute = "not-callable"
+
+
+def test_kernel_rejects_non_callable_protocol_implementation() -> None:
+    with pytest.raises(ModuleDependencyError, match="API implementation"):
+        Kernel([_loaded(NonCallableApiModule(), 0)])
 
 
 def test_kernel_rejects_duplicate_module_names() -> None:
@@ -143,7 +239,7 @@ async def test_optional_module_failure_degrades_and_does_not_abort_startup() -> 
 
     await kernel.start()
 
-    assert optional.state is ModuleState.DEGRADED
+    assert optional.state is ModuleState.FAILED
     assert ready.state is ModuleState.READY
     assert kernel.health_status()["status"] == "degraded"
     assert "secret" not in repr(kernel.module_statuses())
@@ -202,6 +298,132 @@ async def test_module_proxy_enforces_protocol_api_whitelist() -> None:
     with pytest.raises(ModuleLookupError):
         kernel.get_module("missing")
     await kernel.stop()
+
+
+@pytest.mark.asyncio
+async def test_cached_proxy_callable_rechecks_module_state_on_each_call() -> None:
+    kernel = Kernel([_loaded(ContractModule(), 0)])
+    await kernel.start()
+    exposed = kernel.get_module("contract").exposed
+
+    assert exposed() == "ok"
+    await kernel.stop()
+
+    with pytest.raises(ModuleDependencyError, match="unavailable"):
+        exposed()
+
+
+class RoutedModule(ContractModule):
+    http_endpoints = (
+        HttpEndpointSpec(path="/contract", methods=("GET",), target_api="exposed"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_degraded_module_api_and_routes_remain_callable() -> None:
+    module = RoutedModule()
+    module.optional_provider_names = ("missing",)
+    kernel = Kernel([_loaded(module, 0)])
+
+    await kernel.start()
+
+    assert module.state is ModuleState.DEGRADED
+    assert kernel.get_module("contract").exposed() == "ok"
+    assert kernel.route_bindings()[0].handler() == "ok"
+    await kernel.stop()
+
+
+@pytest.mark.asyncio
+async def test_missing_optional_module_degrades_consumer_and_accessor_returns_none() -> (
+    None
+):
+    observed: list[object | None] = []
+
+    class Consumer(Module):
+        name = "consumer"
+        optional_dependencies = ("missing",)
+
+        async def on_start(self, context: ModuleContext) -> None:
+            observed.append(context.optional_module("missing"))
+
+    module = Consumer()
+    kernel = Kernel([_loaded(module, 0)])
+
+    await kernel.start()
+
+    assert observed == [None]
+    assert module.state is ModuleState.DEGRADED
+    await kernel.stop()
+
+
+@pytest.mark.asyncio
+async def test_degraded_required_dependency_degrades_consumer_without_blocking() -> (
+    None
+):
+    events: list[str] = []
+    dependency = RecordingModule("dependency", events)
+    dependency.optional_provider_names = ("missing",)
+    consumer = RecordingModule("consumer", events, dependencies=("dependency",))
+    kernel = Kernel([_loaded(dependency, 0), _loaded(consumer, 1)])
+
+    await kernel.start()
+
+    assert dependency.state is ModuleState.DEGRADED
+    assert consumer.state is ModuleState.DEGRADED
+    assert "start:consumer" in events
+    await kernel.stop()
+
+
+@pytest.mark.asyncio
+async def test_registration_failure_cleans_all_registered_modules_once_in_reverse() -> (
+    None
+):
+    events: list[str] = []
+
+    class BrokenRegistration(RecordingModule):
+        def on_register(self, context: ModuleContext) -> None:
+            super().on_register(context)
+            raise RuntimeError("private registration detail")
+
+    first = RecordingModule("first", events)
+    broken = BrokenRegistration("broken", events)
+    kernel = Kernel([_loaded(first, 0), _loaded(broken, 1)])
+
+    with pytest.raises(KernelStartupError):
+        await kernel.start()
+    assert events == [
+        "register:first",
+        "register:broken",
+        "stop:broken",
+        "stop:first",
+    ]
+    assert broken.state is ModuleState.FAILED
+    assert await kernel.stop() == []
+
+
+@pytest.mark.asyncio
+async def test_optional_registration_failure_is_failed_and_does_not_double_clean() -> (
+    None
+):
+    events: list[str] = []
+
+    class BrokenRegistration(RecordingModule):
+        def on_register(self, context: ModuleContext) -> None:
+            super().on_register(context)
+            raise RuntimeError("private registration detail")
+
+    broken = BrokenRegistration("broken", events)
+    ready = RecordingModule("ready", events)
+    kernel = Kernel(
+        [_loaded(broken, 0, required=False), _loaded(ready, 1, required=True)]
+    )
+
+    await kernel.start()
+    await kernel.stop()
+
+    assert broken.state is ModuleState.FAILED
+    assert events.count("stop:broken") == 1
+    assert ready.state is ModuleState.STOPPED
 
 
 @pytest.mark.asyncio

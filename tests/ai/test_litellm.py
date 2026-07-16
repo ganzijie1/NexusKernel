@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from nexuskernel.ai import (
+from nexus_kernel.ai import (
     AgentToolSpec,
     AiProviderError,
     AiTimeoutError,
@@ -40,7 +40,7 @@ async def test_litellm_passes_credentials_explicitly_and_closes_public_clients()
         closed.append(True)
 
     client = LiteLLMClient(
-        api_key="explicit-secret",
+        api_key="explicit-secret",  # security-test-fixture
         model="provider/model",
         base_url="https://models.example/v1",
         completion=completion,
@@ -80,7 +80,7 @@ async def test_litellm_normalizes_timeout_and_exception() -> None:
         return None
 
     timeout_client = LiteLLMClient(
-        api_key="secret",
+        api_key="secret",  # security-test-fixture
         model="provider/model",
         timeout_seconds=0.01,
         completion=slow,
@@ -94,7 +94,7 @@ async def test_litellm_normalizes_timeout_and_exception() -> None:
         raise RuntimeError("Authorization: Bearer must-not-leak")
 
     broken_client = LiteLLMClient(
-        api_key="secret",
+        api_key="secret",  # security-test-fixture
         model="provider/model",
         completion=broken,
         close_clients=no_close,
@@ -103,3 +103,56 @@ async def test_litellm_normalizes_timeout_and_exception() -> None:
         await broken_client.chat(request)
     assert "must-not-leak" not in str(captured.value)
     assert "private prompt" not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_litellm_concurrent_close_is_single_and_failure_can_retry() -> None:
+    calls = 0
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def completion(**kwargs: Any) -> Any:
+        raise AssertionError("completion is not used")
+
+    async def close_clients() -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        await release.wait()
+
+    client = LiteLLMClient(
+        api_key="secret",  # security-test-fixture
+        model="provider/model",
+        completion=completion,
+        close_clients=close_clients,
+    )
+    first = asyncio.create_task(client.close())
+    second = asyncio.create_task(client.close())
+    await entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    release.set()
+    await second
+    assert calls == 1
+
+    retry_calls = 0
+
+    async def flaky_close() -> None:
+        nonlocal retry_calls
+        retry_calls += 1
+        if retry_calls == 1:
+            raise RuntimeError("private close detail")
+
+    retrying = LiteLLMClient(
+        api_key="secret",  # security-test-fixture
+        model="provider/model",
+        completion=completion,
+        close_clients=flaky_close,
+    )
+    with pytest.raises(AiProviderError) as captured:
+        await retrying.close()
+    assert captured.value.__cause__ is None
+    assert "private close detail" not in str(captured.value)
+    await retrying.close()
+    assert retry_calls == 2

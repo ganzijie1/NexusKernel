@@ -1,26 +1,47 @@
-"""Template Chat service: Bearer authentication plus runtime dispatch."""
+"""Template Chat service: trusted identity plus AI runtime dispatch."""
 
 from __future__ import annotations
 
-import hmac
 from collections.abc import Sequence
-from typing import cast
+from typing import Protocol, cast
 
-from pydantic import SecretStr
+from fastapi import Request
 
-from nexuskernel.ai import (
+from app.services.identity import (
+    AuthNotConfiguredError,
+    BearerIdentityResolver,
+    TrustedIdentityResolver,
+)
+from nexus_kernel.ai import (
     AgentRuntime,
     AgentToolSpec,
     AiProviderError,
-    AiProviderUnavailableError,
-    AuthNotConfiguredError,
+    AiTimeoutError,
     ChatRequest,
     ChatResponse,
     ModelClient,
-    UnauthorizedError,
 )
-from nexuskernel.providers import ProviderRegistry
-from nexuskernel.runtime import get_request_context
+from nexus_kernel.errors import FrameworkError
+from nexus_kernel.providers import ProviderRegistry
+
+
+class AiProviderUnavailableError(FrameworkError):
+    """Raised when the application has no usable AI runtime."""
+
+
+class AiRequestTimeoutError(FrameworkError):
+    """Raised when the complete AI request deadline is exceeded."""
+
+
+class ChatService(Protocol):
+    async def chat(
+        self, request: ChatRequest, http_request: Request
+    ) -> ChatResponse: ...
+
+
+class DisabledChatService:
+    async def chat(self, request: ChatRequest, http_request: Request) -> ChatResponse:
+        raise AuthNotConfiguredError("Chat authentication is not configured")
 
 
 class AppChatService:
@@ -28,27 +49,20 @@ class AppChatService:
         self,
         providers: ProviderRegistry,
         *,
-        service_token: str | None,
+        service_token: str | None = None,
+        identity_resolver: TrustedIdentityResolver | None = None,
         tools: Sequence[AgentToolSpec] = (),
     ) -> None:
+        if service_token is not None and identity_resolver is not None:
+            raise ValueError("configure service_token or identity_resolver, not both")
         self._providers = providers
-        self._service_token = SecretStr(service_token) if service_token else None
+        self._identity_resolver = identity_resolver or BearerIdentityResolver(
+            service_token
+        )
         self._tools = tuple(tools)
 
-    def _authenticate(self, authorization: str | None) -> None:
-        if self._service_token is None:
-            raise AuthNotConfiguredError("Chat authentication is not configured")
-        if authorization is None or not authorization.startswith("Bearer "):
-            raise UnauthorizedError("Chat request is unauthorized")
-        presented = authorization.removeprefix("Bearer ")
-        expected = self._service_token.get_secret_value()
-        if not presented or not hmac.compare_digest(presented, expected):
-            raise UnauthorizedError("Chat request is unauthorized")
-
-    async def chat(
-        self, request: ChatRequest, authorization: str | None
-    ) -> ChatResponse:
-        self._authenticate(authorization)
+    async def chat(self, request: ChatRequest, http_request: Request) -> ChatResponse:
+        identity = await self._identity_resolver.resolve(http_request)
         runtime = self._providers.get("ai_runtime")
         if runtime is None:
             raise AiProviderUnavailableError("AI runtime is unavailable")
@@ -60,17 +74,14 @@ class AppChatService:
             run = getattr(runtime, "run", None)
             if callable(run):
                 agent = cast(AgentRuntime, runtime)
-                context = get_request_context()
-                user_id = request.user_id or "anonymous"
-                session_id = request.session_id or (
-                    context.request_id if context else "default-session"
-                )
                 return await agent.run(
                     request,
-                    user_id=user_id,
-                    session_id=session_id,
+                    identity=identity,
+                    session_id=request.session_id,
                     tools=self._tools,
                 )
-        except AiProviderError as exc:
-            raise AiProviderUnavailableError("AI runtime is unavailable") from exc
+        except AiTimeoutError:
+            raise AiRequestTimeoutError("AI request timed out") from None
+        except AiProviderError:
+            raise AiProviderUnavailableError("AI runtime is unavailable") from None
         raise AiProviderUnavailableError("AI runtime contract is invalid")

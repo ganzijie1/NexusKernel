@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from nexuskernel.runtime import bind_request_context, get_request_context
+from nexus_kernel.runtime import bind_request_context, get_request_context
 
 
 def test_request_context_is_scoped_and_restored() -> None:

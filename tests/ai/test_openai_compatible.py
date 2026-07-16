@@ -6,10 +6,11 @@ from typing import Any
 
 import pytest
 
-from nexuskernel.ai import (
+from nexus_kernel.ai import (
     AgentToolSpec,
     AiProviderError,
     AiTimeoutError,
+    AiToolError,
     ChatMessage,
     ChatRequest,
     OpenAICompatibleClient,
@@ -36,8 +37,10 @@ class FakeOpenAI:
         self.completions = FakeCompletions(responses)
         self.chat = SimpleNamespace(completions=self.completions)
         self.closed = False
+        self.close_calls = 0
 
     async def close(self) -> None:
+        self.close_calls += 1
         self.closed = True
 
 
@@ -103,7 +106,7 @@ async def test_openai_maps_messages_tools_executes_calls_and_sums_usage() -> Non
         handler=lookup_weather,
     )
     client = OpenAICompatibleClient(
-        api_key="test-secret",
+        api_key="test-secret",  # security-test-fixture
         model="fake-model",
         base_url="https://models.example/v1",
         timeout_seconds=1,
@@ -147,7 +150,7 @@ async def test_openai_normalizes_timeout_and_provider_error_without_secrets() ->
         await asyncio.sleep(60)
 
     timeout_client = OpenAICompatibleClient(
-        api_key="secret",
+        api_key="secret",  # security-test-fixture
         model="fake",
         timeout_seconds=0.01,
         client=FakeOpenAI([slow]),
@@ -158,7 +161,7 @@ async def test_openai_normalizes_timeout_and_provider_error_without_secrets() ->
         )
 
     broken_client = OpenAICompatibleClient(
-        api_key="secret",
+        api_key="secret",  # security-test-fixture
         model="fake",
         client=FakeOpenAI([RuntimeError("api_key=must-not-leak")]),
     )
@@ -168,3 +171,210 @@ async def test_openai_normalizes_timeout_and_provider_error_without_secrets() ->
         )
     assert "must-not-leak" not in str(captured.value)
     assert "private" not in str(captured.value)
+    assert captured.value.__cause__ is None
+
+
+@pytest.mark.asyncio
+async def test_openai_rejects_invalid_usage_and_recovers_health() -> None:
+    fake = FakeOpenAI(
+        [
+            {
+                **_response("bad"),
+                "usage": {
+                    "prompt_tokens": "2",
+                    "completion_tokens": 1,
+                    "total_tokens": 3,
+                },
+            },
+            _response("good"),
+        ]
+    )
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        client=fake,  # security-test-fixture
+    )
+    request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+
+    with pytest.raises(AiProviderError) as captured:
+        await client.chat(request)
+    assert captured.value.__cause__ is None
+    assert await client.health_check() is False
+
+    response = await client.chat(request)
+    assert response.message.content == "good"
+    assert await client.health_check() is True
+
+
+@pytest.mark.asyncio
+async def test_openai_rejects_whitespace_only_response() -> None:
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        client=FakeOpenAI([_response("   ")]),  # security-test-fixture
+    )
+
+    with pytest.raises(AiProviderError, match="no text"):
+        await client.chat(
+            ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+        )
+
+
+@pytest.mark.asyncio
+async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None:
+    handler_calls: list[int] = []
+
+    async def handler(arguments: dict[str, Any]) -> dict[str, int]:
+        handler_calls.append(arguments["value"])
+        return {"value": arguments["value"]}
+
+    tool = AgentToolSpec(
+        name="lookup",
+        description="Look up a value.",
+        parameters={
+            "type": "object",
+            "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+            "additionalProperties": False,
+        },
+        handler=handler,
+    )
+    invalid_args = FakeOpenAI(
+        [
+            _response(
+                None,
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": '{"value":"1"}'},
+                    }
+                ],
+            )
+        ]
+    )
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        client=invalid_args,  # security-test-fixture
+    )
+    request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+    with pytest.raises(AiToolError):
+        await client.chat(request, (tool,))
+    assert handler_calls == []
+
+    batch = FakeOpenAI(
+        [
+            _response(
+                None,
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": '{"value":1}'},
+                    },
+                    {
+                        "id": "call-2",
+                        "function": {"name": "lookup", "arguments": '{"value":2}'},
+                    },
+                ],
+            )
+        ]
+    )
+    limited = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        max_tool_calls=1,
+        client=batch,
+    )
+    with pytest.raises(AiToolError, match="budget"):
+        await limited.chat(request, (tool,))
+    assert handler_calls == []
+
+    rounds = FakeOpenAI(
+        [
+            _response(
+                None,
+                tool_calls=[
+                    {
+                        "id": "call-1",
+                        "function": {"name": "lookup", "arguments": '{"value":1}'},
+                    }
+                ],
+            ),
+            _response(
+                None,
+                tool_calls=[
+                    {
+                        "id": "call-2",
+                        "function": {"name": "lookup", "arguments": '{"value":2}'},
+                    }
+                ],
+            ),
+        ]
+    )
+    one_round = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        max_tool_rounds=1,
+        client=rounds,
+    )
+    with pytest.raises(AiProviderError, match="round"):
+        await one_round.chat(request, (tool,))
+    assert handler_calls == [1]
+
+    async def slow(arguments: dict[str, Any]) -> dict[str, bool]:
+        await asyncio.sleep(60)
+        return {"ok": True}
+
+    slow_tool = AgentToolSpec(
+        name="slow",
+        description="Wait.",
+        parameters={"type": "object", "properties": {}},
+        handler=slow,
+    )
+    tool_call = _response(
+        None,
+        tool_calls=[{"id": "call", "function": {"name": "slow", "arguments": "{}"}}],
+    )
+    timeout = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        tool_timeout_seconds=0.01,
+        client=FakeOpenAI([tool_call]),
+    )
+    with pytest.raises(AiTimeoutError):
+        await timeout.chat(request, (slow_tool,))
+    assert await timeout.health_check() is True
+
+    large_tool = AgentToolSpec(
+        name="large",
+        description="Return a large result.",
+        parameters={"type": "object", "properties": {}},
+        handler=lambda arguments: "x" * 100,
+    )
+    large_call = _response(
+        None,
+        tool_calls=[{"id": "call", "function": {"name": "large", "arguments": "{}"}}],
+    )
+    oversized = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        max_tool_result_bytes=16,
+        client=FakeOpenAI([large_call]),
+    )
+    with pytest.raises(AiToolError, match="size"):
+        await oversized.chat(request, (large_tool,))
+
+
+@pytest.mark.asyncio
+async def test_openai_close_is_concurrent_idempotent() -> None:
+    fake = FakeOpenAI([])
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="fake",
+        client=fake,  # security-test-fixture
+    )
+
+    await asyncio.gather(client.close(), client.close(), client.close())
+
+    assert fake.close_calls == 1
+    assert await client.health_check() is False

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import traceback
 from collections.abc import Callable
 
 import pytest
 
-from nexuskernel.errors import ProviderError, ProviderUnavailableError
-from nexuskernel.kernel import ProviderState
-from nexuskernel.providers import ProviderRegistry, ProviderSpec
+from nexus_kernel.errors import ProviderError, ProviderUnavailableError
+from nexus_kernel.providers import ProviderRegistry, ProviderSpec, ProviderState
 
 
 class FakeProvider:
@@ -99,10 +99,58 @@ async def test_optional_provider_failure_degrades_without_leaking_exception() ->
     assert status == {
         "name": "optional",
         "required": False,
-        "state": "degraded",
+        "state": "failed",
         "error": "provider_initialization_failed",
     }
     assert "secret-value" not in repr(status)
+
+
+@pytest.mark.asyncio
+async def test_async_factory_and_start_share_one_initialization_deadline() -> None:
+    events: list[str] = []
+
+    async def slow_factory() -> FakeProvider:
+        await asyncio.sleep(0.03)
+        return FakeProvider("slow", events)
+
+    registry = ProviderRegistry()
+    registry.register(
+        ProviderSpec(
+            "slow",
+            slow_factory,
+            required=False,
+            timeout_seconds=0.01,
+        )
+    )
+
+    await asyncio.wait_for(registry.initialize_all(), timeout=0.1)
+
+    assert events == []
+    assert registry.statuses()[0] == {
+        "name": "slow",
+        "required": False,
+        "state": "failed",
+        "error": "provider_initialization_timeout",
+    }
+
+
+@pytest.mark.asyncio
+async def test_required_async_factory_timeout_rolls_back_active_providers() -> None:
+    events: list[str] = []
+    registry = ProviderRegistry()
+    registry.register(ProviderSpec("first", _factory(FakeProvider("first", events))))
+
+    async def blocked_factory() -> FakeProvider:
+        await asyncio.sleep(60)
+        return FakeProvider("blocked", events)
+
+    registry.register(ProviderSpec("blocked", blocked_factory, timeout_seconds=0.01))
+
+    with pytest.raises(ProviderUnavailableError):
+        await registry.initialize_all()
+
+    assert events == ["start:first", "close:first"]
+    assert registry.statuses()[1]["error"] == "provider_initialization_timeout"
 
 
 @pytest.mark.asyncio
@@ -133,6 +181,32 @@ async def test_required_provider_failure_rolls_back_started_providers() -> None:
     ]
     assert registry.statuses()[0]["state"] == "stopped"
     assert registry.statuses()[1]["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_required_provider_failure_suppresses_sensitive_exception_chain() -> None:
+    sensitive = "sdk-sensitive-credential"
+    registry = ProviderRegistry()
+    registry.register(
+        ProviderSpec(
+            "required",
+            _factory(
+                FakeProvider(
+                    "required",
+                    [],
+                    start_error=RuntimeError(sensitive),
+                )
+            ),
+        )
+    )
+
+    with pytest.raises(ProviderUnavailableError) as captured:
+        await registry.initialize_all()
+
+    rendered = "".join(traceback.format_exception(captured.value))
+    assert sensitive not in rendered
+    assert captured.value.__cause__ is None
+    assert captured.value.__suppress_context__ is True
 
 
 @pytest.mark.asyncio
@@ -288,3 +362,15 @@ async def test_require_rejects_unknown_and_unavailable_providers() -> None:
 def test_provider_spec_requires_a_stable_identifier(name: str) -> None:
     with pytest.raises(ValueError):
         ProviderSpec(name, lambda: object())
+
+
+def test_provider_states_define_the_public_lifecycle() -> None:
+    assert [state.value for state in ProviderState] == [
+        "registered",
+        "starting",
+        "ready",
+        "degraded",
+        "disabled",
+        "stopped",
+        "failed",
+    ]

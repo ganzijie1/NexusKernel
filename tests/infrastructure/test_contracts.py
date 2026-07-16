@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from nexuskernel.infrastructure import MongoDocumentStore, StoredDocument
+from nexus_kernel.infrastructure import MongoDocumentStore, StoredDocument
 
 
 class FakeCollection:

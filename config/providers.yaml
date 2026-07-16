@@ -1,0 +1,11 @@
+providers:
+  mongo:
+    dsn: ${NEXUS_KERNEL_MONGO_DSN:-}
+    database: ${NEXUS_KERNEL_MONGO_DATABASE:-}
+  redis:
+    dsn: ${NEXUS_KERNEL_REDIS_DSN:-}
+  postgres:
+    dsn: ${NEXUS_KERNEL_POSTGRES_DSN:-}
+  qdrant:
+    url: ${NEXUS_KERNEL_QDRANT_URL:-}
+    api_key: ${NEXUS_KERNEL_QDRANT_API_KEY:-}
