@@ -1,45 +1,28 @@
-name: nexuskernel-starter-preprod
+name: nexus-kernel-starter-preprod
 
 services:
   api:
-    image: "${NEXUSKERNEL_IMAGE:-nexuskernel-starter:preprod}"
+    image: "${NEXUS_KERNEL_IMAGE:?NEXUS_KERNEL_IMAGE must be set}"
     env_file:
       - path: .env.preprod
         required: false
     environment:
-      NEXUSKERNEL_RUNTIME_ROLE: api
+      NEXUS_KERNEL_RUNTIME_ROLE: api
     ports:
-      - "${NEXUSKERNEL_PORT:-8030}:${NEXUSKERNEL_PORT:-8030}"
+      - "${NEXUS_KERNEL_PORT:-8030}:${NEXUS_KERNEL_PORT:-8030}"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NEXUSKERNEL_PORT:-8030}/health/live')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NEXUS_KERNEL_PORT:-8030}/health/live')"]
       interval: 15s
       timeout: 3s
       retries: 5
 
   worker:
-    image: "${NEXUSKERNEL_IMAGE:-nexuskernel-starter:preprod}"
+    image: "${NEXUS_KERNEL_IMAGE:?NEXUS_KERNEL_IMAGE must be set}"
     env_file:
       - path: .env.preprod
         required: false
     environment:
-      NEXUSKERNEL_RUNTIME_ROLE: worker
+      NEXUS_KERNEL_RUNTIME_ROLE: worker
     profiles: ["worker"]
     restart: unless-stopped
-
-  mongo:
-    image: mongo:8.0
-    profiles: ["infra"]
-    volumes:
-      - mongo-data:/data/db
-
-  redis:
-    image: redis:8.0-alpine
-    profiles: ["infra"]
-    command: ["redis-server", "--appendonly", "yes"]
-    volumes:
-      - redis-data:/data
-
-volumes:
-  mongo-data: {}
-  redis-data: {}

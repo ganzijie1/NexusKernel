@@ -2,6 +2,7 @@ stages:
   - quality
   - test
   - package
+  - artifact-test
   - container-smoke
 
 default:
@@ -13,22 +14,38 @@ default:
 quality:
   stage: quality
   script:
-    - python -m compileall -q nexuskernel app
+    - python -m compileall -q nexus_kernel app scripts
     - ruff format --check .
     - ruff check .
-    - mypy nexuskernel app scripts/init_project.py
+    - ruff check --select C901 nexus_kernel app scripts
+    - mypy nexus_kernel app scripts/init_project.py scripts/check_python_version.py scripts/verify_wheel.py
     - python -m pip check
     - python scripts/security_scan.py
+    - git diff --check
 
 test:
   stage: test
+  image: python:${PYTHON_VERSION}-slim
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
   script:
     - pytest -m "not real_llm" -q
+    - python -m pip check
+
+macos-test:
+  stage: test
+  tags: ["macos"]
+  before_script: []
+  script:
+    - bash scripts/setup_python_env.sh --python python3.13 --recreate
+    - .venv-macos/bin/python -m pytest -m "not real_llm" -q
+    - .venv-macos/bin/python -m pip check
 
 real-llm-smoke:
   stage: test
   rules:
-    - if: '$RUN_REAL_LLM_SMOKE == "true" && $NEXUSKERNEL_AI_API_KEY'
+    - if: '$RUN_REAL_LLM_SMOKE == "true" && $NEXUS_KERNEL_AI_API_KEY'
     - when: never
   script:
     - pytest -m real_llm -q
@@ -36,9 +53,45 @@ real-llm-smoke:
 wheel:
   stage: package
   script:
-    - python -m pip wheel --no-deps --wheel-dir dist .
+    - rm -rf build dist *.egg-info
+    - python -m build --wheel --outdir dist
+    - python scripts/verify_wheel.py dist
   artifacts:
     paths: [dist/]
+
+wheel-runtime-extras:
+  stage: artifact-test
+  image: python:${PYTHON_VERSION}-slim
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
+  needs:
+    - job: wheel
+      artifacts: true
+  before_script: []
+  script:
+    - WHEEL_PATH="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+    - test -n "$WHEEL_PATH"
+    - python -m pip install --disable-pip-version-check "${WHEEL_PATH}[ai,mongo,redis,qdrant,otel,postgres]"
+    - python -c "import asyncpg, google.adk, litellm, openai, pymongo, qdrant_client, redis, opentelemetry.sdk, opentelemetry.exporter.otlp.proto.grpc"
+    - python -m pip check
+
+wheel-core-only:
+  stage: artifact-test
+  image: python:${PYTHON_VERSION}-slim
+  parallel:
+    matrix:
+      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
+  needs:
+    - job: wheel
+      artifacts: true
+  before_script: []
+  script:
+    - WHEEL_PATH="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
+    - test -n "$WHEEL_PATH"
+    - python -m pip install --disable-pip-version-check "$WHEEL_PATH"
+    - python -c "import importlib.util; import app, nexus_kernel, nexus_kernel.ai, nexus_kernel.infrastructure; from nexus_kernel.ai import AgentToolSpec; AgentToolSpec(name='echo', description='echo', parameters={'type':'object'}, handler=lambda value:value); assert all(importlib.util.find_spec(name) is None for name in ('google','litellm','openai','pymongo','redis','asyncpg','qdrant_client'))"
+    - python -m pip check
 
 container-smoke:
   stage: container-smoke
@@ -48,17 +101,36 @@ container-smoke:
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
+    NEXUS_KERNEL_DEFAULT_PORT: "8030"
+    NEXUS_KERNEL_IMAGE: nexus-kernel-starter:ci
   before_script: []
   script:
-    - docker compose -f docker/docker-compose-dev.yml config --quiet
-    - docker compose -f docker/docker-compose-preprod.yml config --quiet
-    - docker compose -f docker/docker-compose-prod.yml config --quiet
-    - docker build -f docker/Dockerfile -t nexuskernel-starter:ci .
-    - test "$(docker run --rm nexuskernel-starter:ci id -u)" = "10001"
-    - docker run --rm -d --name nexuskernel-api -e NEXUSKERNEL_PORT=8030 -p 8030:8030 nexuskernel-starter:ci
-    - until wget -qO- http://docker:8030/health/live; do sleep 1; done
-    - wget -qO- http://docker:8030/health/ready
-    - docker rm -f nexuskernel-api
-    - docker run --rm -d --name nexuskernel-worker -e NEXUSKERNEL_RUNTIME_ROLE=worker nexuskernel-starter:ci
-    - test "$(docker inspect -f '{{.State.Running}}' nexuskernel-worker)" = "true"
-    - docker rm -f nexuskernel-worker
+    - docker compose --env-file docker/.env.dev.example -f docker/docker-compose-dev.yml config --quiet
+    - docker compose --env-file docker/.env.preprod.example -f docker/docker-compose-preprod.yml config --quiet
+    - docker compose --env-file docker/.env.prod.example -f docker/docker-compose-prod.yml config --quiet
+    - docker build -f docker/Dockerfile -t nexus-kernel-starter:ci-default .
+    - docker build --build-arg NEXUS_KERNEL_RUNTIME_EXTRAS=ai,mongo,redis,qdrant,otel,postgres -f docker/Dockerfile -t nexus-kernel-starter:ci .
+    - test "$(docker run --rm nexus-kernel-starter:ci id -u)" = "10001"
+    - docker run --rm --read-only --tmpfs /tmp nexus-kernel-starter:ci python -c "import app, nexus_kernel"
+    - docker run --rm -d --name nexus-kernel-api -e NEXUS_KERNEL_PORT="$NEXUS_KERNEL_DEFAULT_PORT" -p "$NEXUS_KERNEL_DEFAULT_PORT:$NEXUS_KERNEL_DEFAULT_PORT" nexus-kernel-starter:ci
+    - |
+      for attempt in $(seq 1 30); do
+        if wget -qO- "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live"; then
+          break
+        fi
+        if [ "$attempt" -eq 30 ]; then
+          docker logs nexus-kernel-api
+          exit 1
+        fi
+        sleep 1
+      done
+    - wget -qO- "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/ready" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(healthy|degraded)"'
+    - docker rm -f nexus-kernel-api
+    - docker run --rm -d --name nexus-kernel-worker -e NEXUS_KERNEL_RUNTIME_ROLE=worker nexus-kernel-starter:ci
+    - sleep 2
+    - test "$(docker inspect -f '{{.State.Running}}' nexus-kernel-worker)" = "true"
+    - docker rm -f nexus-kernel-worker
+  after_script:
+    - docker logs nexus-kernel-api 2>/dev/null || true
+    - docker logs nexus-kernel-worker 2>/dev/null || true
+    - docker rm -f nexus-kernel-api nexus-kernel-worker 2>/dev/null || true

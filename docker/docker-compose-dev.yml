@@ -1,31 +1,33 @@
-name: nexuskernel-starter-dev
+name: nexus-kernel-starter-dev
 
 services:
   api:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    image: nexuskernel-starter:dev
+      args:
+        NEXUS_KERNEL_RUNTIME_EXTRAS: "${NEXUS_KERNEL_RUNTIME_EXTRAS:-ai,mongo,redis}"
+    image: nexus-kernel-starter:dev
     env_file:
       - path: .env.dev
         required: false
     environment:
-      NEXUSKERNEL_RUNTIME_ROLE: api
+      NEXUS_KERNEL_RUNTIME_ROLE: api
     ports:
-      - "${NEXUSKERNEL_PORT:-8030}:${NEXUSKERNEL_PORT:-8030}"
+      - "${NEXUS_KERNEL_PORT:-8030}:${NEXUS_KERNEL_PORT:-8030}"
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NEXUSKERNEL_PORT:-8030}/health/live')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NEXUS_KERNEL_PORT:-8030}/health/live')"]
       interval: 10s
       timeout: 3s
       retries: 5
 
   worker:
-    image: nexuskernel-starter:dev
+    image: nexus-kernel-starter:dev
     env_file:
       - path: .env.dev
         required: false
     environment:
-      NEXUSKERNEL_RUNTIME_ROLE: worker
+      NEXUS_KERNEL_RUNTIME_ROLE: worker
     profiles: ["worker"]
     depends_on:
       api:
