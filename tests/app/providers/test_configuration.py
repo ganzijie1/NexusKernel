@@ -10,6 +10,10 @@ from pydantic import ValidationError
 
 from nexus_kernel.errors import ConfigError
 from nexus_kernel.providers import ProviderRegistry
+from tests.project_contract import load_project_contract
+
+
+PROJECT = load_project_contract()
 
 
 def _providers_module() -> Any:
@@ -35,9 +39,9 @@ def test_empty_repository_configuration_disables_fixed_providers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     for name in ("MONGO_DSN", "MONGO_DATABASE", "REDIS_DSN", "POSTGRES_DSN"):
-        monkeypatch.delenv(f"NEXUS_KERNEL_{name}", raising=False)
-    monkeypatch.delenv("NEXUS_KERNEL_QDRANT_URL", raising=False)
-    monkeypatch.delenv("NEXUS_KERNEL_QDRANT_API_KEY", raising=False)
+        monkeypatch.delenv(PROJECT.environment_name(name), raising=False)
+    monkeypatch.delenv(PROJECT.environment_name("QDRANT_URL"), raising=False)
+    monkeypatch.delenv(PROJECT.environment_name("QDRANT_API_KEY"), raising=False)
     module = _providers_module()
 
     settings = module.load_provider_settings(Path("config/providers.yaml"))
@@ -124,6 +128,27 @@ def test_provider_models_reject_coerced_scalar_types(
         module.InfrastructureProviderSettings.model_validate(
             {"providers": provider_config}
         )
+
+
+@pytest.mark.parametrize("provider", ["mongo", "redis", "postgres", "qdrant"])
+def test_required_provider_must_have_enabling_configuration(provider: str) -> None:
+    module = _providers_module()
+
+    with pytest.raises(ValidationError, match="required provider must be configured"):
+        module.InfrastructureProviderSettings.model_validate(
+            {"providers": {provider: {"required": True}}}
+        )
+
+
+def test_required_unconfigured_provider_yaml_fails_closed(tmp_path: Path) -> None:
+    module = _providers_module()
+    path = _write(
+        tmp_path / "providers.yaml",
+        "providers:\n  mongo:\n    required: true\n",
+    )
+
+    with pytest.raises(ConfigError, match="validation failed"):
+        module.load_provider_settings(path)
 
 
 @pytest.mark.parametrize(

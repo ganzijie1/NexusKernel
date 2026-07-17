@@ -23,7 +23,9 @@ def test_application_settings_defaults_and_forbids_unknown_fields() -> None:
 
     assert settings.service.name == "NexusKernel Starter"
     assert settings.server.port == 8030
+    assert settings.server.max_response_buffer_bytes == 10 * 1024 * 1024
     assert settings.runtime.role == "api"
+    assert settings.runtime.module_cleanup_timeout_seconds == 5.0
 
     with pytest.raises(ValidationError):
         ApplicationSettings.model_validate({"server": {"unexpected": True}})
@@ -33,7 +35,9 @@ def test_application_settings_defaults_and_forbids_unknown_fields() -> None:
     ("section", "field", "value"),
     [
         ("server", "max_request_body_bytes", 0),
+        ("server", "max_response_buffer_bytes", 0),
         ("server", "request_timeout_seconds", 0),
+        ("runtime", "module_cleanup_timeout_seconds", 0),
         ("monitoring", "metrics_cache_ttl_seconds", 0),
         ("monitoring", "health_timeout_seconds", -1),
     ],

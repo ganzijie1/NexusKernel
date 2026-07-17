@@ -20,7 +20,7 @@ _SENSITIVE_KEY = re.compile(
     re.IGNORECASE,
 )
 _BEARER = re.compile(r"(?i)bearer\s+[A-Za-z0-9._~+/-]+")
-_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")  # security-pattern
+_OPENAI_KEY = re.compile(r"\bsk-[A-Za-z0-9_-]{6,}\b")
 _CREDENTIAL_URL = re.compile(
     r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^\s/@:]+:[^\s/@]+@",
     re.IGNORECASE,
@@ -30,6 +30,19 @@ _SENSITIVE_ASSIGNMENT = re.compile(
     r"prompt|tool[_-]?(?:payload|arguments|result)|raw[_-]?(?:request|response)|"
     r"model[_-]?response|url|uri|dsn)\b[\"']?\s*[:=]\s*[^,;\r\n]+"
 )
+_ADK_LOGGER_PREFIXES = (
+    "google.adk",
+    "google_adk",
+    "google.genai",
+    "google_genai",
+)
+
+
+def _is_adk_sdk_logger(name: str) -> bool:
+    return any(
+        name == prefix or name.startswith(f"{prefix}.")
+        for prefix in _ADK_LOGGER_PREFIXES
+    )
 
 
 def _redact_text(value: str) -> str:
@@ -68,12 +81,24 @@ class _InterceptHandler(logging.Handler):
     """Forward standard logging without untrusted traceback or argument objects."""
 
     def emit(self, record: logging.LogRecord) -> None:
+        if _is_adk_sdk_logger(record.name):
+            if record.levelno < logging.WARNING:
+                return
+            message = (
+                "adk_sdk_error"
+                if record.levelno >= logging.ERROR
+                else "adk_sdk_warning"
+            )
+            logger.opt(exception=None, depth=6).log(record.levelno, message)
+            return
         try:
             level: str | int = logger.level(record.levelname).name
         except ValueError:
             level = record.levelno
         if record.name == "uvicorn.access":
             message = "uvicorn_access"
+        elif record.name == "asyncio" or record.name.startswith("asyncio."):
+            message = "asyncio_runtime_error"
         else:
             try:
                 message = _redact_text(record.getMessage())
@@ -87,7 +112,12 @@ def _configure_standard_logging(level: str) -> None:
     root = logging.getLogger()
     root.handlers = [handler]
     root.setLevel(level)
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+    for name in (
+        "uvicorn",
+        "uvicorn.error",
+        "uvicorn.access",
+        *_ADK_LOGGER_PREFIXES,
+    ):
         configured = logging.getLogger(name)
         configured.handlers = [handler]
         configured.setLevel(level)

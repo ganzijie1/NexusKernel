@@ -42,6 +42,16 @@ class _ProviderConfig(_StrictModel):
     timeout_seconds: float = Field(default=5.0, gt=0)
     _schemes: ClassVar[frozenset[str]]
 
+    @property
+    def enabled(self) -> bool:
+        raise NotImplementedError
+
+    @model_validator(mode="after")
+    def required_provider_must_be_configured(self) -> _ProviderConfig:
+        if self.required and not self.enabled:
+            raise ValueError("required provider must be configured")
+        return self
+
 
 class MongoProviderConfig(_ProviderConfig):
     _schemes = frozenset({"mongodb", "mongodb+srv"})

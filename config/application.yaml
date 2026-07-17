@@ -5,9 +5,11 @@ server:
   host: ${NEXUS_KERNEL_HOST:-0.0.0.0}
   port: ${NEXUS_KERNEL_PORT:-8030}
   max_request_body_bytes: ${NEXUS_KERNEL_MAX_REQUEST_BODY_BYTES:-10485760}
+  max_response_buffer_bytes: ${NEXUS_KERNEL_MAX_RESPONSE_BUFFER_BYTES:-10485760}
   request_timeout_seconds: ${NEXUS_KERNEL_REQUEST_TIMEOUT_SECONDS:-30}
 runtime:
   role: ${NEXUS_KERNEL_RUNTIME_ROLE:-api}
+  module_cleanup_timeout_seconds: ${NEXUS_KERNEL_MODULE_CLEANUP_TIMEOUT_SECONDS:-5}
 monitoring:
   metrics_prefix: ${NEXUS_KERNEL_METRICS_PREFIX:-nexus_kernel}
   metrics_cache_ttl_seconds: ${NEXUS_KERNEL_METRICS_CACHE_TTL_SECONDS:-5}

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import heapq
 import inspect
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import wraps
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
 
 
 _OPERATIONAL_STATES = frozenset({ModuleState.READY, ModuleState.DEGRADED})
+_RESOLVABLE_STATES = frozenset(
+    {ModuleState.REGISTERED, ModuleState.READY, ModuleState.DEGRADED}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +42,14 @@ class ModuleRouteBinding:
     module_name: str
     spec: HttpEndpointSpec
     handler: Callable[..., Any]
+
+
+@dataclass(slots=True)
+class _ModuleCleanup:
+    task: asyncio.Task[None]
+    prior_state: ModuleState
+    prior_error: str | None
+    cancel_requested: bool = False
 
 
 class ModuleApiProxy:
@@ -99,7 +111,14 @@ class Kernel:
         self,
         modules: Iterable[LoadedModule],
         providers: ProviderRegistry | None = None,
+        *,
+        module_cleanup_timeout_seconds: float = 5.0,
     ) -> None:
+        if (
+            not math.isfinite(module_cleanup_timeout_seconds)
+            or module_cleanup_timeout_seconds <= 0
+        ):
+            raise ValueError("module cleanup timeout must be a positive finite value")
         entries = list(modules)
         self._entries = self._index_entries(entries)
         self._ordered = self._resolve_topology(entries)
@@ -113,12 +132,14 @@ class Kernel:
         }
         self._worker_specs = self._index_worker_specs()
         self._cleanup_pending: list[LoadedModule] = []
+        self._cleanup_tasks: dict[str, _ModuleCleanup] = {}
         self._cleaned: set[str] = set()
         self._module_errors: dict[str, str | None] = {
             entry.module.name: None for entry in entries
         }
         self._running = False
         self._stopped = False
+        self._module_cleanup_timeout_seconds = module_cleanup_timeout_seconds
         self._lifecycle_lock = asyncio.Lock()
 
     @staticmethod
@@ -186,8 +207,8 @@ class Kernel:
             optional_modules=module.optional_dependencies,
             required_providers=module.required_provider_names,
             optional_providers=module.optional_provider_names,
-            module_resolver=self._require_operational_module,
-            optional_module_resolver=self._optional_operational_module,
+            module_resolver=self._require_resolvable_module,
+            optional_module_resolver=self._optional_resolvable_module,
             provider_resolver=self._providers.require,
             optional_provider_resolver=self._providers.get,
         )
@@ -225,6 +246,12 @@ class Kernel:
     def providers(self) -> ProviderRegistry:
         return self._providers
 
+    @property
+    def shutdown_complete(self) -> bool:
+        """Return whether every Module and Provider has reached a terminal stop."""
+
+        return self._stopped
+
     def get_module(self, name: str) -> ModuleApiProxy:
         try:
             module = self._entries[name].module
@@ -232,15 +259,15 @@ class Kernel:
             raise ModuleLookupError(f"Module is not registered: {name}") from None
         return ModuleApiProxy(module)
 
-    def _require_operational_module(self, name: str) -> ModuleApiProxy:
+    def _require_resolvable_module(self, name: str) -> ModuleApiProxy:
         proxy = self.get_module(name)
-        if self._entries[name].module.state not in _OPERATIONAL_STATES:
+        if self._entries[name].module.state not in _RESOLVABLE_STATES:
             raise ModuleDependencyError(f"Required module is unavailable: {name}")
         return proxy
 
-    def _optional_operational_module(self, name: str) -> ModuleApiProxy | None:
+    def _optional_resolvable_module(self, name: str) -> ModuleApiProxy | None:
         entry = self._entries.get(name)
-        if entry is None or entry.module.state not in _OPERATIONAL_STATES:
+        if entry is None or entry.module.state not in _RESOLVABLE_STATES:
             return None
         return ModuleApiProxy(entry.module)
 
@@ -288,14 +315,18 @@ class Kernel:
                 if entry.module.state is ModuleState.FAILED:
                     continue
                 await self._start_module(entry)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             await self._rollback_startup()
-            raise
+            raise cancellation
         except KernelStartupError:
-            await self._rollback_startup()
+            cleanup_cancellation = await self._rollback_startup()
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise
         except Exception:
-            await self._rollback_startup()
+            cleanup_cancellation = await self._rollback_startup()
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
             raise KernelStartupError("Kernel startup failed") from None
         self._running = True
 
@@ -305,10 +336,16 @@ class Kernel:
             self._cleanup_pending.append(entry)
             try:
                 module.on_register(self._contexts[module.name])
+            except asyncio.CancelledError:
+                module.state = ModuleState.FAILED
+                self._module_errors[module.name] = "module_registration_cancelled"
+                raise
             except Exception:
                 module.state = ModuleState.FAILED
                 self._module_errors[module.name] = "module_registration_failed"
-                await self._cleanup_module(entry)
+                _, cleanup_cancellation, _ = await self._cleanup_module(entry)
+                if cleanup_cancellation is not None:
+                    raise cleanup_cancellation
                 if entry.required:
                     raise KernelStartupError(
                         f"Required module registration failed: {module.name}"
@@ -349,11 +386,11 @@ class Kernel:
             degraded = degraded or optional_provider_missing
             module.state = ModuleState.STARTING
             await module.on_start(self._contexts[module.name])
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as cancellation:
             module.state = ModuleState.FAILED
             self._module_errors[module.name] = "module_start_cancelled"
             await self._cleanup_module(entry)
-            raise
+            raise cancellation
         except Exception:
             await self._module_failed(entry, "module_start_failed")
             return
@@ -367,38 +404,118 @@ class Kernel:
         module = entry.module
         module.state = ModuleState.FAILED
         self._module_errors[module.name] = error_code
-        await self._cleanup_module(entry)
+        _, cleanup_cancellation, _ = await self._cleanup_module(entry)
+        if cleanup_cancellation is not None:
+            raise cleanup_cancellation
         if entry.required:
             raise KernelStartupError(
                 f"Required module failed to start: {module.name}"
             ) from None
 
-    async def _cleanup_module(self, entry: LoadedModule) -> str | None:
+    async def _wait_for_module_cleanup(
+        self,
+        cleanup: _ModuleCleanup,
+        *,
+        allow_retry: bool,
+    ) -> tuple[bool, bool, asyncio.CancelledError | None]:
+        task = cleanup.task
+        if cleanup.cancel_requested and not task.done() and not allow_retry:
+            return False, False, None
+
+        deadline = (
+            asyncio.get_running_loop().time() + self._module_cleanup_timeout_seconds
+        )
+        cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                break
+            try:
+                done, _ = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
+                continue
+            if not done:
+                break
+
+        if not task.done():
+            if not cleanup.cancel_requested:
+                cleanup.cancel_requested = True
+                task.cancel()
+            return False, False, cancellation
+
+        try:
+            task.result()
+        except BaseException:
+            return True, False, cancellation
+        return True, True, cancellation
+
+    @staticmethod
+    def _consume_module_cleanup_result(task: asyncio.Task[None]) -> None:
+        try:
+            task.result()
+        except BaseException:
+            pass
+
+    async def _cleanup_module(
+        self,
+        entry: LoadedModule,
+        *,
+        allow_retry: bool = True,
+    ) -> tuple[str | None, asyncio.CancelledError | None, bool]:
         module = entry.module
         if module.name in self._cleaned:
-            return None
+            return None, None, False
+        cleanup = self._cleanup_tasks.get(module.name)
+        if cleanup is None:
+            task = asyncio.create_task(
+                module.on_stop(self._contexts[module.name]),
+                name=f"nexus_kernel_module_cleanup_{module.name}",
+            )
+            task.add_done_callback(self._consume_module_cleanup_result)
+            cleanup = _ModuleCleanup(
+                task=task,
+                prior_state=module.state,
+                prior_error=self._module_errors[module.name],
+            )
+            self._cleanup_tasks[module.name] = cleanup
+        terminal, succeeded, cancellation = await self._wait_for_module_cleanup(
+            cleanup,
+            allow_retry=allow_retry,
+        )
+        if not terminal:
+            module.state = ModuleState.FAILED
+            self._module_errors[module.name] = "module_stop_timeout"
+            return f"module_stop_timeout:{module.name}", cancellation, True
+
         self._cleaned.add(module.name)
-        prior_state = module.state
-        try:
-            await module.on_stop(self._contexts[module.name])
-        except asyncio.CancelledError:
+        if not succeeded:
             module.state = ModuleState.FAILED
-            self._module_errors[module.name] = "module_stop_cancelled"
-            raise
-        except Exception:
-            module.state = ModuleState.FAILED
-            self._module_errors[module.name] = "module_stop_failed"
-            return f"module_stop_failed:{module.name}"
-        if prior_state is not ModuleState.FAILED:
+            if cleanup.prior_state is ModuleState.FAILED:
+                self._module_errors[module.name] = cleanup.prior_error
+            else:
+                self._module_errors[module.name] = "module_stop_failed"
+            return f"module_stop_failed:{module.name}", cancellation, False
+        if cleanup.prior_state is not ModuleState.FAILED:
             module.state = ModuleState.STOPPED
             self._module_errors[module.name] = None
-        return None
+        else:
+            module.state = ModuleState.FAILED
+            self._module_errors[module.name] = cleanup.prior_error
+        return None, cancellation, False
 
-    async def _rollback_startup(self) -> None:
-        await self._stop_registered_modules()
-        await self._providers.close_all()
+    async def _rollback_startup(self) -> asyncio.CancelledError | None:
+        _, cancellation, pending = await self._stop_registered_modules(
+            allow_retry=False
+        )
+        if not pending:
+            try:
+                await self._providers.close_all()
+            except asyncio.CancelledError as exc:
+                cancellation = cancellation or exc
         self._running = False
-        self._stopped = True
+        self._stopped = not pending
+        return cancellation
 
     async def stop(self) -> list[str]:
         async with self._lifecycle_lock:
@@ -407,20 +524,44 @@ class Kernel:
     async def _stop_once(self) -> list[str]:
         if self._stopped:
             return []
-        errors = await self._stop_registered_modules()
-        errors.extend(await self._providers.close_all())
+        errors, cancellation, pending = await self._stop_registered_modules()
         self._running = False
+        if pending:
+            if cancellation is not None:
+                raise cancellation
+            return errors
+
+        try:
+            errors.extend(await self._providers.close_all())
+        except asyncio.CancelledError as exc:
+            cancellation = cancellation or exc
         self._stopped = True
+        if cancellation is not None:
+            raise cancellation
         return errors
 
-    async def _stop_registered_modules(self) -> list[str]:
+    async def _stop_registered_modules(
+        self,
+        *,
+        allow_retry: bool = True,
+    ) -> tuple[list[str], asyncio.CancelledError | None, bool]:
         errors: list[str] = []
-        for entry in reversed(self._cleanup_pending):
-            error = await self._cleanup_module(entry)
+        cancellation: asyncio.CancelledError | None = None
+        while self._cleanup_pending:
+            entry = self._cleanup_pending[-1]
+            error, cleanup_cancellation, pending = await self._cleanup_module(
+                entry,
+                allow_retry=allow_retry,
+            )
+            cancellation = cancellation or cleanup_cancellation
             if error is not None:
                 errors.append(error)
-        self._cleanup_pending.clear()
-        return errors
+            if pending:
+                return errors, cancellation, True
+            self._cleanup_pending.pop()
+            if cancellation is not None:
+                return errors, cancellation, bool(self._cleanup_pending)
+        return errors, cancellation, False
 
     def module_statuses(self) -> list[dict[str, Any]]:
         return [

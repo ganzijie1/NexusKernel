@@ -18,6 +18,16 @@ from nexus_kernel.runtime.workers import WorkerSpec
 _HTTP_METHOD = re.compile(r"^[A-Z]+$")
 
 
+def _api_descriptor(value: Any) -> tuple[str, Callable[..., Any]] | None:
+    if isinstance(value, staticmethod):
+        return "static", value.__func__
+    if isinstance(value, classmethod):
+        return "class", value.__func__
+    if inspect.isfunction(value):
+        return "instance", value
+    return None
+
+
 @dataclass(frozen=True, slots=True)
 class HttpEndpointSpec:
     path: str
@@ -190,7 +200,11 @@ class Module:
         names: list[str] = []
         for contract in reversed(self.api_contract.__mro__):
             for name, value in vars(contract).items():
-                if name.startswith("_") or not callable(value) or name in names:
+                if (
+                    name.startswith("_")
+                    or _api_descriptor(value) is None
+                    or name in names
+                ):
                     continue
                 names.append(name)
         return names
@@ -200,14 +214,21 @@ class Module:
 
     def validate_api_implementation(self) -> None:
         for name in self.get_api_contract():
-            contract_callable = getattr(self.api_contract, name, None)
-            implementation = getattr(type(self), name, None)
+            contract_descriptor = _api_descriptor(
+                inspect.getattr_static(self.api_contract, name, None)
+            )
+            implementation_descriptor = _api_descriptor(
+                inspect.getattr_static(type(self), name, None)
+            )
             if (
-                not callable(contract_callable)
-                or not callable(implementation)
-                or not self._signatures_match(contract_callable, implementation)
-                or inspect.iscoroutinefunction(contract_callable)
-                is not inspect.iscoroutinefunction(implementation)
+                contract_descriptor is None
+                or implementation_descriptor is None
+                or contract_descriptor[0] != implementation_descriptor[0]
+                or not self._signatures_match(
+                    contract_descriptor[1], implementation_descriptor[1]
+                )
+                or inspect.iscoroutinefunction(contract_descriptor[1])
+                is not inspect.iscoroutinefunction(implementation_descriptor[1])
             ):
                 raise ModuleDependencyError(
                     f"Module API implementation is invalid: {self.name}.{name}"

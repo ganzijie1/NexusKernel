@@ -8,6 +8,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from collections import deque
+from typing import Any
 
 from loguru import logger
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -158,24 +159,237 @@ class RequestBodyLimitMiddleware:
         await response(scope, receive, send)
 
 
-class RequestTimeoutMiddleware(BaseHTTPMiddleware):
+class RequestTimeoutMiddleware:
     def __init__(
-        self, app: Callable[..., Awaitable[None]], *, timeout_seconds: float
+        self,
+        app: ASGIApp,
+        *,
+        timeout_seconds: float,
+        max_response_buffer_bytes: int,
+        metrics: MetricsRegistry,
     ) -> None:
-        super().__init__(app)
+        self.app = app
         self._timeout_seconds = timeout_seconds
+        self._max_response_buffer_bytes = max_response_buffer_bytes
+        self._metrics = metrics
 
-    async def dispatch(
-        self, request: Request, call_next: RequestResponseEndpoint
-    ) -> Response:
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        buffered = _BufferedHttpResponse(self._max_response_buffer_bytes)
+
+        async def run_application() -> None:
+            await self.app(scope, receive, buffered.send)
+
+        app_task: asyncio.Task[None] = asyncio.create_task(run_application())
+        ready_task = asyncio.create_task(buffered.ready.wait())
         try:
-            return await asyncio.wait_for(
-                call_next(request), timeout=self._timeout_seconds
-            )
+            async with asyncio.timeout(self._timeout_seconds):
+                done, _ = await asyncio.wait(
+                    {app_task, ready_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                if ready_task not in done:
+                    _raise_response_task_error(app_task)
         except TimeoutError:
-            return error_response(
-                "request_timeout", "Request timed out.", status_code=504
-            )
+            _abandon_response(app_task, buffered)
+            await self._send_error(scope, receive, send, "request_timeout", 504)
+            return
+        except _ResponseTooLarge:
+            _abandon_response(app_task, buffered)
+            await self._send_error(scope, receive, send, "response_too_large", 500)
+            return
+        except _InvalidResponse:
+            _abandon_response(app_task, buffered)
+            await self._send_error(scope, receive, send, "invalid_response", 500)
+            return
+        except asyncio.CancelledError:
+            _abandon_response(app_task, buffered)
+            raise
+        finally:
+            if not ready_task.done():
+                ready_task.cancel()
+                ready_task.add_done_callback(_consume_task_result)
+
+        start, body = buffered.response_messages()
+        try:
+            await send(start)
+            await send(body)
+        except BaseException:
+            _abandon_response(app_task, buffered)
+            raise
+
+        buffered.commit()
+        try:
+            await asyncio.shield(app_task)
+        except asyncio.CancelledError:
+            current = asyncio.current_task()
+            if current is not None and current.cancelling():
+                app_task.add_done_callback(self._observe_background_task)
+                raise
+            self._record_background_failure()
+        except BaseException:
+            self._record_background_failure()
+
+    async def _send_error(
+        self,
+        scope: Scope,
+        receive: Receive,
+        send: Send,
+        code: str,
+        status_code: int,
+    ) -> None:
+        messages = {
+            "request_timeout": "Request timed out.",
+            "response_too_large": "Response exceeds the configured limit.",
+            "invalid_response": "Application returned an invalid response.",
+        }
+        response = error_response(code, messages[code], status_code=status_code)
+        await response(scope, receive, send)
+
+    def _observe_background_task(self, task: asyncio.Task[None]) -> None:
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            error = asyncio.CancelledError()
+        if error is not None:
+            self._record_background_failure()
+
+    def _record_background_failure(self) -> None:
+        logger.error("http_background_task_failed")
+        self._metrics.record_background_failure()
+
+
+class _ResponseBufferError(Exception):
+    pass
+
+
+class _ResponseTooLarge(_ResponseBufferError):
+    pass
+
+
+class _InvalidResponse(_ResponseBufferError):
+    pass
+
+
+class _BufferedHttpResponse:
+    def __init__(self, limit: int) -> None:
+        self.ready = asyncio.Event()
+        self._release = asyncio.Event()
+        self._limit = limit
+        self._size = 0
+        self._start: Message | None = None
+        self._body = bytearray()
+        self._complete = False
+        self._abandoned = False
+
+    async def send(self, message: Message) -> None:
+        if self._abandoned:
+            raise _InvalidResponse from None
+        message_type = message.get("type")
+        if message_type == "http.response.start":
+            self._set_start(message)
+            return
+        if message_type != "http.response.body":
+            raise _InvalidResponse from None
+        if self._start is None or self._complete:
+            raise _InvalidResponse from None
+        if set(message) - {"type", "body", "more_body"}:
+            raise _InvalidResponse from None
+        body = message.get("body", b"")
+        more_body = message.get("more_body", False)
+        if not isinstance(body, bytes) or not isinstance(more_body, bool):
+            raise _InvalidResponse from None
+        self._reserve(len(body))
+        self._body.extend(body)
+        await asyncio.sleep(0)
+        if not more_body:
+            self._complete = True
+            self.ready.set()
+            await self._release.wait()
+            if self._abandoned:
+                raise _InvalidResponse from None
+
+    def _set_start(self, message: Message) -> None:
+        if self._start is not None or self._complete:
+            raise _InvalidResponse from None
+        if set(message) - {"type", "status", "headers"}:
+            raise _InvalidResponse from None
+        status = message.get("status")
+        headers = message.get("headers", [])
+        if (
+            not isinstance(status, int)
+            or isinstance(status, bool)
+            or not 100 <= status <= 999
+            or not isinstance(headers, (list, tuple))
+        ):
+            raise _InvalidResponse from None
+        copied_headers: list[tuple[bytes, bytes]] = []
+        header_bytes = 0
+        for header in headers:
+            if not isinstance(header, (list, tuple)) or len(header) != 2:
+                raise _InvalidResponse from None
+            name, value = header
+            if not isinstance(name, bytes) or not isinstance(value, bytes):
+                raise _InvalidResponse from None
+            copied_headers.append((name, value))
+            header_bytes += len(name) + len(value)
+        self._reserve(header_bytes)
+        self._start = {
+            "type": "http.response.start",
+            "status": status,
+            "headers": copied_headers,
+        }
+
+    def _reserve(self, size: int) -> None:
+        if self._size + size > self._limit:
+            raise _ResponseTooLarge from None
+        self._size += size
+
+    def response_messages(self) -> tuple[Message, Message]:
+        if self._start is None or not self._complete:
+            raise _InvalidResponse from None
+        return self._start, {
+            "type": "http.response.body",
+            "body": bytes(self._body),
+            "more_body": False,
+        }
+
+    def commit(self) -> None:
+        self._release.set()
+
+    def abandon(self) -> None:
+        self._abandoned = True
+        self._release.set()
+
+
+def _raise_response_task_error(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except _ResponseTooLarge:
+        raise
+    except _InvalidResponse:
+        raise
+    except BaseException:
+        raise _InvalidResponse from None
+    raise _InvalidResponse from None
+
+
+def _consume_task_result(task: asyncio.Task[Any]) -> None:
+    try:
+        task.exception()
+    except asyncio.CancelledError:
+        pass
+
+
+def _abandon_response(
+    task: asyncio.Task[None], buffered: _BufferedHttpResponse
+) -> None:
+    buffered.abandon()
+    if not task.done():
+        task.cancel()
+    task.add_done_callback(_consume_task_result)
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):

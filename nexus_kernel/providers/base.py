@@ -44,5 +44,7 @@ class ProviderSpec:
 
         if re.fullmatch(r"[a-z][a-z0-9_]*", self.name) is None:
             raise ValueError("provider name must be a stable lowercase identifier")
+        if self.required and not self.enabled:
+            raise ValueError("required provider cannot be disabled")
         if self.timeout_seconds <= 0:
             raise ValueError("provider timeout_seconds must be positive")

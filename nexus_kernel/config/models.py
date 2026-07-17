@@ -20,11 +20,13 @@ class ServerSettings(_StrictModel):
     host: str = "0.0.0.0"
     port: int = Field(default=8030, ge=1, le=65535)
     max_request_body_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
+    max_response_buffer_bytes: int = Field(default=10 * 1024 * 1024, gt=0)
     request_timeout_seconds: float = Field(default=30.0, gt=0)
 
 
 class RuntimeSettings(_StrictModel):
     role: Literal["api", "worker"] = "api"
+    module_cleanup_timeout_seconds: float = Field(default=5.0, gt=0)
 
 
 class MonitoringSettings(_StrictModel):

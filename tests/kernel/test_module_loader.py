@@ -296,6 +296,232 @@ def test_module_protocol_validates_signature_and_async_shape(module: Module) -> 
         module.validate_api_implementation()
 
 
+class InstanceDescriptorApi(Protocol):
+    def execute(self, value: str) -> str: ...
+
+
+class StaticDescriptorMismatchModule(Module):
+    name = "static_descriptor_mismatch"
+    api_contract = InstanceDescriptorApi
+
+    @staticmethod
+    def execute(self, value: str) -> str:
+        return value
+
+
+class ClassDescriptorMismatchModule(Module):
+    name = "class_descriptor_mismatch"
+    api_contract = InstanceDescriptorApi
+
+    @classmethod
+    def execute(cls, self, value: str) -> str:
+        return value
+
+
+class StaticDescriptorApi(Protocol):
+    @staticmethod
+    def execute(value: str) -> str: ...
+
+
+class InstanceForStaticDescriptorModule(Module):
+    name = "instance_for_static_descriptor"
+    api_contract = StaticDescriptorApi
+
+    def execute(self, value: str) -> str:
+        return value
+
+
+class ClassForStaticDescriptorModule(Module):
+    name = "class_for_static_descriptor"
+    api_contract = StaticDescriptorApi
+
+    @classmethod
+    def execute(cls, value: str) -> str:
+        return value
+
+
+class ClassDescriptorApi(Protocol):
+    @classmethod
+    def execute(cls, value: str) -> str: ...
+
+
+class InstanceForClassDescriptorModule(Module):
+    name = "instance_for_class_descriptor"
+    api_contract = ClassDescriptorApi
+
+    def execute(self, value: str) -> str:
+        return value
+
+
+class StaticForClassDescriptorModule(Module):
+    name = "static_for_class_descriptor"
+    api_contract = ClassDescriptorApi
+
+    @staticmethod
+    def execute(cls, value: str) -> str:
+        return value
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        StaticDescriptorMismatchModule(),
+        ClassDescriptorMismatchModule(),
+        InstanceForStaticDescriptorModule(),
+        ClassForStaticDescriptorModule(),
+        InstanceForClassDescriptorModule(),
+        StaticForClassDescriptorModule(),
+    ],
+)
+def test_module_protocol_rejects_descriptor_binding_mismatches(module: Module) -> None:
+    with pytest.raises(ModuleDependencyError, match="API implementation is invalid"):
+        module.validate_api_implementation()
+
+
+class MatchingDescriptorApi(Protocol):
+    @staticmethod
+    def static_value(value: str) -> str: ...
+
+    @classmethod
+    def class_value(cls, value: str) -> str: ...
+
+
+class MatchingDescriptorModule(Module):
+    name = "matching_descriptors"
+    api_contract = MatchingDescriptorApi
+
+    @staticmethod
+    def static_value(value: str) -> str:
+        return value
+
+    @classmethod
+    def class_value(cls, value: str) -> str:
+        return f"{cls.name}:{value}"
+
+
+class MatchingInstanceDescriptorModule(Module):
+    name = "matching_instance_descriptor"
+    api_contract = InstanceDescriptorApi
+
+    def execute(self, value: str) -> str:
+        return value
+
+
+def test_module_protocol_accepts_matching_static_and_class_descriptors() -> None:
+    module = MatchingDescriptorModule()
+    instance_module = MatchingInstanceDescriptorModule()
+
+    module.validate_api_implementation()
+    instance_module.validate_api_implementation()
+
+    assert module.get_api_contract() == ["static_value", "class_value"]
+
+
+class AsyncStaticDescriptorApi(Protocol):
+    @staticmethod
+    async def execute(value: str) -> str: ...
+
+
+class SyncStaticForAsyncDescriptorModule(Module):
+    name = "sync_static_for_async_descriptor"
+    api_contract = AsyncStaticDescriptorApi
+
+    @staticmethod
+    def execute(value: str) -> str:
+        return value
+
+
+class SyncStaticDescriptorApi(Protocol):
+    @staticmethod
+    def execute(value: str) -> str: ...
+
+
+class AsyncStaticForSyncDescriptorModule(Module):
+    name = "async_static_for_sync_descriptor"
+    api_contract = SyncStaticDescriptorApi
+
+    @staticmethod
+    async def execute(value: str) -> str:
+        return value
+
+
+class AsyncClassDescriptorApi(Protocol):
+    @classmethod
+    async def execute(cls, value: str) -> str: ...
+
+
+class SyncClassForAsyncDescriptorModule(Module):
+    name = "sync_class_for_async_descriptor"
+    api_contract = AsyncClassDescriptorApi
+
+    @classmethod
+    def execute(cls, value: str) -> str:
+        return value
+
+
+class SyncClassDescriptorApi(Protocol):
+    @classmethod
+    def execute(cls, value: str) -> str: ...
+
+
+class AsyncClassForSyncDescriptorModule(Module):
+    name = "async_class_for_sync_descriptor"
+    api_contract = SyncClassDescriptorApi
+
+    @classmethod
+    async def execute(cls, value: str) -> str:
+        return value
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        SyncStaticForAsyncDescriptorModule(),
+        AsyncStaticForSyncDescriptorModule(),
+        SyncClassForAsyncDescriptorModule(),
+        AsyncClassForSyncDescriptorModule(),
+    ],
+)
+def test_descriptor_protocol_rejects_static_and_class_async_shape_mismatches(
+    module: Module,
+) -> None:
+    with pytest.raises(ModuleDependencyError, match="API implementation is invalid"):
+        module.validate_api_implementation()
+
+
+class MatchingAsyncDescriptorApi(Protocol):
+    @staticmethod
+    async def static_value(value: str) -> str: ...
+
+    @classmethod
+    async def class_value(cls, value: str) -> str: ...
+
+
+class MatchingAsyncDescriptorModule(Module):
+    name = "matching_async_descriptors"
+    api_contract = MatchingAsyncDescriptorApi
+
+    @staticmethod
+    async def static_value(value: str) -> str:
+        return value
+
+    @classmethod
+    async def class_value(cls, value: str) -> str:
+        return f"{cls.name}:{value}"
+
+
+@pytest.mark.asyncio
+async def test_descriptor_protocol_accepts_matching_async_static_and_class_methods() -> (
+    None
+):
+    module = MatchingAsyncDescriptorModule()
+
+    module.validate_api_implementation()
+
+    assert await module.static_value("static") == "static"
+    assert await module.class_value("class") == "matching_async_descriptors:class"
+
+
 @pytest.mark.asyncio
 async def test_module_default_lifecycle_hooks_are_no_ops() -> None:
     module = Module()

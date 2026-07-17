@@ -20,6 +20,7 @@ from nexus_kernel.kernel import (
     ModuleContext,
     ModuleState,
 )
+from nexus_kernel.providers import ProviderRegistry, ProviderSpec
 from nexus_kernel.runtime import WorkerSpec
 
 
@@ -266,6 +267,260 @@ async def test_start_cancellation_propagates_after_rollback() -> None:
     assert blocking.state is ModuleState.FAILED
 
 
+@pytest.mark.asyncio
+async def test_repeated_start_cancellation_waits_for_module_cleanup() -> None:
+    events: list[str] = []
+    start_entered = asyncio.Event()
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class BlockingCleanupModule(RecordingModule):
+        def __init__(self) -> None:
+            super().__init__("blocking", events)
+            self.cleaned = False
+
+        async def on_start(self, context: ModuleContext) -> None:
+            events.append("start:blocking")
+            start_entered.set()
+            await asyncio.Event().wait()
+
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append("stop:blocking")
+            stop_entered.set()
+            await release_stop.wait()
+            self.cleaned = True
+
+    first = RecordingModule("first", events)
+    blocking = BlockingCleanupModule()
+    kernel = Kernel([_loaded(first, 0), _loaded(blocking, 1)])
+    starting = asyncio.create_task(kernel.start())
+    await start_entered.wait()
+
+    starting.cancel()
+    await stop_entered.wait()
+    starting.cancel()
+    await asyncio.sleep(0)
+
+    assert not starting.done()
+    assert blocking.cleaned is False
+
+    release_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await starting
+
+    assert blocking.cleaned is True
+    assert first.state is ModuleState.STOPPED
+    assert await kernel.stop() == []
+
+
+@pytest.mark.asyncio
+async def test_stop_hook_self_cancellation_is_stable_and_does_not_block_reverse_cleanup() -> (
+    None
+):
+    events: list[str] = []
+
+    class SelfCancellingStopModule(RecordingModule):
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append(f"stop:{self.name}")
+            raise asyncio.CancelledError
+
+    first = RecordingModule("first", events)
+    second = SelfCancellingStopModule("second", events)
+    kernel = Kernel([_loaded(first, 0), _loaded(second, 1)])
+    await kernel.start()
+
+    errors = await kernel.stop()
+
+    assert errors == ["module_stop_failed:second"]
+    assert events[-2:] == ["stop:second", "stop:first"]
+    assert second.state is ModuleState.FAILED
+    assert kernel.module_statuses()[1]["error"] == "module_stop_failed"
+    assert await kernel.stop() == []
+
+
+@pytest.mark.asyncio
+async def test_stop_hook_self_cancellation_does_not_replace_start_failure() -> None:
+    events: list[str] = []
+
+    class FailedStartAndStopModule(RecordingModule):
+        async def on_start(self, context: ModuleContext) -> None:
+            events.append(f"start:{self.name}")
+            raise RuntimeError("unavailable")
+
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append(f"stop:{self.name}")
+            raise asyncio.CancelledError
+
+    module = FailedStartAndStopModule("failed", events)
+    kernel = Kernel([_loaded(module, 0)])
+
+    with pytest.raises(KernelStartupError):
+        await kernel.start()
+
+    assert events == ["register:failed", "start:failed", "stop:failed"]
+    assert kernel.module_statuses()[0]["error"] == "module_start_failed"
+    assert await kernel.stop() == []
+
+
+@pytest.mark.asyncio
+async def test_repeated_stop_cancellation_converges_before_propagating() -> None:
+    events: list[str] = []
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class BlockingStopModule(RecordingModule):
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append(f"stop:{self.name}")
+            stop_entered.set()
+            await release_stop.wait()
+            events.append(f"stopped:{self.name}")
+
+    module = BlockingStopModule("blocking", events)
+    kernel = Kernel([_loaded(module, 0)])
+    await kernel.start()
+    stopping = asyncio.create_task(kernel.stop())
+    await stop_entered.wait()
+
+    stopping.cancel()
+    await asyncio.sleep(0)
+    stopping.cancel()
+    await asyncio.sleep(0)
+
+    assert not stopping.done()
+    release_stop.set()
+    with pytest.raises(asyncio.CancelledError):
+        await stopping
+
+    assert events[-2:] == ["stop:blocking", "stopped:blocking"]
+    assert module.state is ModuleState.STOPPED
+    assert await kernel.stop() == []
+
+
+def test_kernel_rejects_invalid_module_cleanup_timeout() -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        Kernel([], module_cleanup_timeout_seconds=0)
+
+
+@pytest.mark.asyncio
+async def test_noncooperative_module_stop_preserves_dependencies_until_retry() -> None:
+    events: list[str] = []
+    stop_entered = asyncio.Event()
+    release_stop = asyncio.Event()
+
+    class SharedProvider:
+        async def start(self) -> None:
+            events.append("provider:start")
+
+        async def health_check(self) -> bool:
+            return True
+
+        async def close(self) -> None:
+            events.append("provider:close")
+
+    class ResistantModule(RecordingModule):
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append(f"stop:{self.name}")
+            stop_entered.set()
+            while not release_stop.is_set():
+                try:
+                    await release_stop.wait()
+                except asyncio.CancelledError:
+                    continue
+            events.append(f"stopped:{self.name}")
+
+    provider_registry = ProviderRegistry()
+    provider_registry.register(ProviderSpec("shared", SharedProvider))
+    dependency = RecordingModule("dependency", events)
+    resistant = ResistantModule(
+        "resistant",
+        events,
+        dependencies=("dependency",),
+    )
+    resistant.required_provider_names = ("shared",)
+    kernel = Kernel(
+        [_loaded(dependency, 0), _loaded(resistant, 1)],
+        providers=provider_registry,
+        module_cleanup_timeout_seconds=0.01,
+    )
+    await kernel.start()
+
+    first_errors = await kernel.stop()
+    await stop_entered.wait()
+    second_errors = await kernel.stop()
+
+    assert first_errors == ["module_stop_timeout:resistant"]
+    assert second_errors == ["module_stop_timeout:resistant"]
+    assert kernel.shutdown_complete is False
+    assert events.count("stop:resistant") == 1
+    assert "stop:dependency" not in events
+    assert "provider:close" not in events
+
+    release_stop.set()
+    await asyncio.sleep(0)
+    assert await kernel.stop() == []
+    assert kernel.shutdown_complete is True
+    assert events[-3:] == [
+        "stopped:resistant",
+        "stop:dependency",
+        "provider:close",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_startup_rollback_preserves_provider_while_module_cleanup_is_pending() -> (
+    None
+):
+    events: list[str] = []
+    release_stop = asyncio.Event()
+
+    class SharedProvider:
+        async def start(self) -> None:
+            events.append("provider:start")
+
+        async def health_check(self) -> bool:
+            return True
+
+        async def close(self) -> None:
+            events.append("provider:close")
+
+    class FailedModule(RecordingModule):
+        async def on_start(self, context: ModuleContext) -> None:
+            events.append(f"start:{self.name}")
+            raise RuntimeError("private startup detail")
+
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append(f"stop:{self.name}")
+            while not release_stop.is_set():
+                try:
+                    await release_stop.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    registry = ProviderRegistry()
+    registry.register(ProviderSpec("shared", SharedProvider))
+    module = FailedModule("failed", events)
+    module.required_provider_names = ("shared",)
+    kernel = Kernel(
+        [_loaded(module, 0)],
+        providers=registry,
+        module_cleanup_timeout_seconds=0.01,
+    )
+
+    with pytest.raises(KernelStartupError):
+        await kernel.start()
+
+    assert kernel.shutdown_complete is False
+    assert "provider:close" not in events
+    assert kernel.module_statuses()[0]["error"] == "module_stop_timeout"
+
+    release_stop.set()
+    await asyncio.sleep(0)
+    assert await kernel.stop() == []
+    assert kernel.shutdown_complete is True
+    assert events[-1] == "provider:close"
+    assert kernel.module_statuses()[0]["error"] == "module_start_failed"
+
+
 class PublicApi(Protocol):
     def exposed(self) -> str: ...
 
@@ -371,6 +626,124 @@ async def test_degraded_required_dependency_degrades_consumer_without_blocking()
     assert dependency.state is ModuleState.DEGRADED
     assert consumer.state is ModuleState.DEGRADED
     assert "start:consumer" in events
+    await kernel.stop()
+
+
+@pytest.mark.asyncio
+async def test_on_register_can_cache_a_registered_dependency_proxy() -> None:
+    observed: list[str] = []
+
+    class DependencyApi(Protocol):
+        def value(self) -> str: ...
+
+    class Dependency(Module):
+        name = "dependency"
+        api_contract = DependencyApi
+
+        def value(self) -> str:
+            return "ready"
+
+    class Consumer(Module):
+        name = "consumer"
+        dependencies = ("dependency",)
+
+        def on_register(self, context: ModuleContext) -> None:
+            self.dependency = context.require_module("dependency")
+
+        async def on_start(self, context: ModuleContext) -> None:
+            observed.append(self.dependency.value())
+
+    kernel = Kernel([_loaded(Dependency(), 0), _loaded(Consumer(), 1)])
+
+    await kernel.start()
+
+    assert observed == ["ready"]
+    await kernel.stop()
+
+
+@pytest.mark.asyncio
+async def test_registered_dependency_proxy_is_not_callable_during_registration() -> (
+    None
+):
+    class DependencyApi(Protocol):
+        def value(self) -> str: ...
+
+    class Dependency(Module):
+        name = "dependency"
+        api_contract = DependencyApi
+
+        def value(self) -> str:
+            return "not-yet-ready"
+
+    class Consumer(Module):
+        name = "consumer"
+        dependencies = ("dependency",)
+
+        def on_register(self, context: ModuleContext) -> None:
+            context.require_module("dependency").value()
+
+    consumer = Consumer()
+    kernel = Kernel([_loaded(Dependency(), 0), _loaded(consumer, 1)])
+
+    with pytest.raises(KernelStartupError):
+        await kernel.start()
+
+    assert consumer.state is ModuleState.FAILED
+    assert kernel.module_statuses()[1]["error"] == "module_registration_failed"
+
+
+@pytest.mark.asyncio
+async def test_registration_hook_self_cancellation_remains_failed_after_cleanup() -> (
+    None
+):
+    events: list[str] = []
+
+    class CancelledRegistration(Module):
+        name = "cancelled_registration"
+
+        def on_register(self, context: ModuleContext) -> None:
+            raise asyncio.CancelledError
+
+        async def on_stop(self, context: ModuleContext) -> None:
+            events.append("stop:cancelled_registration")
+
+    module = CancelledRegistration()
+    kernel = Kernel([_loaded(module, 0)])
+
+    with pytest.raises(asyncio.CancelledError):
+        await kernel.start()
+
+    assert events == ["stop:cancelled_registration"]
+    assert module.state is ModuleState.FAILED
+    assert kernel.module_statuses()[0]["error"] == "module_registration_cancelled"
+    assert await kernel.stop() == []
+
+
+@pytest.mark.asyncio
+async def test_on_register_resolves_only_present_optional_dependencies() -> None:
+    observed: list[object | None] = []
+
+    class OptionalDependency(Module):
+        name = "optional"
+
+    class Consumer(Module):
+        name = "consumer"
+        optional_dependencies = ("optional", "missing")
+
+        def on_register(self, context: ModuleContext) -> None:
+            observed.extend(
+                (
+                    context.optional_module("optional"),
+                    context.optional_module("missing"),
+                )
+            )
+
+    kernel = Kernel([_loaded(OptionalDependency(), 0), _loaded(Consumer(), 1)])
+
+    await kernel.start()
+
+    assert observed[0] is not None
+    assert observed[1] is None
     await kernel.stop()
 
 
