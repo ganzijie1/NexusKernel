@@ -13,7 +13,8 @@ async def run_worker(
     runtime: ApplicationRuntime | None = None,
     stop_event: asyncio.Event | None = None,
 ) -> None:
-    runtime = runtime or build_runtime()
+    if runtime is None:
+        runtime = build_runtime()
     stop_event = stop_event or asyncio.Event()
     loop = asyncio.get_running_loop()
     for signal_name in (signal.SIGINT, signal.SIGTERM):

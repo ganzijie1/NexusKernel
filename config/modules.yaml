@@ -18,8 +18,24 @@ modules:
       tool_timeout_seconds: ${NEXUS_KERNEL_AI_TOOL_TIMEOUT_SECONDS:-10}
       max_tool_rounds: ${NEXUS_KERNEL_AI_MAX_TOOL_ROUNDS:-4}
       max_tool_calls: ${NEXUS_KERNEL_AI_MAX_TOOL_CALLS:-16}
+      max_tool_argument_bytes: ${NEXUS_KERNEL_AI_MAX_TOOL_ARGUMENT_BYTES:-65536}
       max_tool_result_bytes: ${NEXUS_KERNEL_AI_MAX_TOOL_RESULT_BYTES:-65536}
       adk_app_name: ${NEXUS_KERNEL_ADK_APP_NAME:-nexus_kernel}
       adk_session_ttl_seconds: ${NEXUS_KERNEL_ADK_SESSION_TTL_SECONDS:-1800}
       adk_session_max_entries: ${NEXUS_KERNEL_ADK_SESSION_MAX_ENTRIES:-256}
       adk_session_max_events: ${NEXUS_KERNEL_ADK_SESSION_MAX_EVENTS:-200}
+      adk_session_cleanup_timeout_seconds: ${NEXUS_KERNEL_ADK_SESSION_CLEANUP_TIMEOUT_SECONDS:-2}
+  agent_runs:
+    class: app.modules.agent_runs.module.AgentRunsModule
+    enabled: ${NEXUS_KERNEL_AGENT_RUNS_ENABLED:-false}
+    required: false
+    config:
+      max_entries: ${NEXUS_KERNEL_AGENT_RUNS_MAX_ENTRIES:-256}
+      max_concurrent_phases: ${NEXUS_KERNEL_AGENT_RUNS_MAX_CONCURRENT_PHASES:-4}
+      phase_timeout_seconds: ${NEXUS_KERNEL_AGENT_RUNS_PHASE_TIMEOUT_SECONDS:-300}
+      overall_lifetime_seconds: ${NEXUS_KERNEL_AGENT_RUNS_OVERALL_LIFETIME_SECONDS:-3600}
+      action_timeout_seconds: ${NEXUS_KERNEL_AGENT_RUNS_ACTION_TIMEOUT_SECONDS:-900}
+      terminal_retention_seconds: ${NEXUS_KERNEL_AGENT_RUNS_TERMINAL_RETENTION_SECONDS:-3600}
+      max_resumes: ${NEXUS_KERNEL_AGENT_RUNS_MAX_RESUMES:-16}
+      max_payload_bytes: ${NEXUS_KERNEL_AGENT_RUNS_MAX_PAYLOAD_BYTES:-65536}
+      poll_interval_seconds: ${NEXUS_KERNEL_AGENT_RUNS_POLL_INTERVAL_SECONDS:-1}

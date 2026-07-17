@@ -12,7 +12,7 @@ def test_application_modules_use_package_module_layout() -> None:
     modules_root = ROOT / "app" / "modules"
     missing = [
         path.relative_to(ROOT).as_posix()
-        for name in ("example", "chat")
+        for name in ("example", "chat", "agent_runs")
         for path in (
             modules_root / name / "__init__.py",
             modules_root / name / "module.py",
@@ -36,3 +36,18 @@ def test_project_module_class_paths_target_module_files() -> None:
         "app.modules.example.module.ExampleModule"
     )
     assert settings.modules["chat"].class_path == "app.modules.chat.module.ChatModule"
+    agent_runs = settings.modules["agent_runs"]
+    assert agent_runs.class_path == "app.modules.agent_runs.module.AgentRunsModule"
+    assert agent_runs.enabled is False
+    assert agent_runs.required is False
+    assert agent_runs.config == {
+        "max_entries": 256,
+        "max_concurrent_phases": 4,
+        "phase_timeout_seconds": 300,
+        "overall_lifetime_seconds": 3600,
+        "action_timeout_seconds": 900,
+        "terminal_retention_seconds": 3600,
+        "max_resumes": 16,
+        "max_payload_bytes": 65536,
+        "poll_interval_seconds": 1,
+    }

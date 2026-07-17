@@ -66,6 +66,8 @@ class _WorkerEntry:
     state: WorkerState = WorkerState.REGISTERED
     error: str | None = None
     task: asyncio.Task[None] | None = None
+    stop_cancel_requested: bool = False
+    stop_timed_out: bool = False
 
 
 class WorkerSupervisor:
@@ -76,6 +78,13 @@ class WorkerSupervisor:
         self._required_failure = asyncio.Event()
         self._started = False
         self._stopped = False
+        self._stop_lock = asyncio.Lock()
+
+    @property
+    def shutdown_complete(self) -> bool:
+        """Return whether every registered Worker task is terminal."""
+
+        return self._stopped
 
     def register(self, spec: WorkerSpec) -> None:
         if self._started:
@@ -106,11 +115,15 @@ class WorkerSupervisor:
         try:
             await entry.spec.runner(self._stop_event)
         except asyncio.CancelledError:
-            self._transition(entry, WorkerState.STOPPED)
+            if not entry.stop_timed_out:
+                self._transition(entry, WorkerState.STOPPED)
             raise
         except Exception:
-            self._fail(entry, "worker_failed")
+            if not entry.stop_timed_out:
+                self._fail(entry, "worker_failed")
         else:
+            if entry.stop_timed_out:
+                return
             if self._stop_event.is_set():
                 self._transition(entry, WorkerState.STOPPED)
             else:
@@ -136,6 +149,8 @@ class WorkerSupervisor:
             return
         try:
             listener(self._status(entry))
+        except asyncio.CancelledError:
+            logger.warning("worker_status_listener_failed name=%s", entry.spec.name)
         except Exception:
             logger.warning("worker_status_listener_failed name=%s", entry.spec.name)
 
@@ -164,46 +179,51 @@ class WorkerSupervisor:
         )
 
     async def stop_all(self) -> list[str]:
-        if self._stopped:
-            return []
-        self._stop_event.set()
-        errors: list[str] = []
-        for entry in reversed(tuple(self._entries.values())):
-            task = entry.task
-            if task is None:
-                self._transition(entry, WorkerState.STOPPED)
-                continue
-            if task.done():
-                if entry.spec.required and entry.state is WorkerState.FAILED:
-                    errors.append(f"{entry.error}:{entry.spec.name}")
-                continue
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(task),
-                    timeout=entry.spec.shutdown_timeout_seconds,
-                )
-            except TimeoutError:
-                task.cancel()
-                done, _ = await asyncio.wait(
-                    {task}, timeout=entry.spec.shutdown_timeout_seconds
-                )
-                if not done:
+        async with self._stop_lock:
+            if self._stopped:
+                return []
+            self._stop_event.set()
+            errors: list[str] = []
+            pending = False
+            for entry in reversed(tuple(self._entries.values())):
+                error, entry_pending = await self._stop_entry(entry)
+                pending = pending or entry_pending
+                if error is not None:
+                    errors.append(error)
+            self._stopped = not pending
+            return errors
+
+    async def _stop_entry(self, entry: _WorkerEntry) -> tuple[str | None, bool]:
+        task = entry.task
+        if task is None:
+            self._transition(entry, WorkerState.STOPPED)
+            return None, False
+        if not task.done():
+            done, _ = await asyncio.wait(
+                {task}, timeout=entry.spec.shutdown_timeout_seconds
+            )
+            if not done:
+                if not entry.stop_timed_out:
+                    entry.stop_timed_out = True
+                    self._transition(entry, WorkerState.FAILED, "worker_stop_timeout")
+                    if entry.spec.required:
+                        self._required_failure.set()
+                    log = logger.error if entry.spec.required else logger.warning
+                    log(
+                        "worker_stop_timeout name=%s required=%s",
+                        entry.spec.name,
+                        entry.spec.required,
+                    )
+                if not entry.stop_cancel_requested:
+                    entry.stop_cancel_requested = True
                     task.cancel()
-                    await asyncio.sleep(0)
-                self._transition(entry, WorkerState.FAILED, "worker_stop_timeout")
-                log = logger.error if entry.spec.required else logger.warning
-                log(
-                    "worker_stop_timeout name=%s required=%s",
-                    entry.spec.name,
-                    entry.spec.required,
-                )
-                if entry.spec.required:
-                    errors.append(f"worker_stop_timeout:{entry.spec.name}")
-            else:
-                if entry.spec.required and entry.state is WorkerState.FAILED:
-                    errors.append(f"{entry.error}:{entry.spec.name}")
-        self._stopped = True
-        return errors
+                await asyncio.sleep(0)
+
+        pending = not task.done()
+        if entry.state is WorkerState.FAILED and (entry.spec.required or pending):
+            error = entry.error or "worker_failed"
+            return f"{error}:{entry.spec.name}", pending
+        return None, pending
 
     def statuses(self) -> list[WorkerStatus]:
         return [self._status(entry) for entry in self._entries.values()]

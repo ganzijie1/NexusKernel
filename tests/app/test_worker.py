@@ -48,3 +48,22 @@ async def test_run_worker_exits_and_cleans_up_after_delayed_required_failure() -
 
     assert captured.value.errors == ("worker_failed:delayed_failure",)
     assert runtime.stop_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_run_worker_does_not_load_api_only_agent_registry(monkeypatch) -> None:
+    runtime = _DelayedFailureRuntime()
+    captured: list[dict[str, object]] = []
+
+    def fake_build_runtime(**kwargs):
+        captured.append(kwargs)
+        return runtime
+
+    monkeypatch.setattr("app.worker.build_runtime", fake_build_runtime)
+    stop_event = asyncio.Event()
+    stop_event.set()
+
+    await run_worker(None, stop_event)
+
+    assert captured == [{}]
+    assert runtime.stop_calls == 1

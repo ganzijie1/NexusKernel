@@ -36,6 +36,48 @@ async def test_worker_supervisor_starts_and_gracefully_stops_workers() -> None:
 
 
 @pytest.mark.asyncio
+async def test_worker_cancellation_after_stop_is_a_normal_terminal_state() -> None:
+    async def cancels_after_stop(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+        raise asyncio.CancelledError
+
+    supervisor = WorkerSupervisor()
+    supervisor.register(WorkerSpec("cancelled", cancels_after_stop))
+    await supervisor.start_all()
+
+    assert await supervisor.stop_all() == []
+    assert await supervisor.stop_all() == []
+    assert supervisor.statuses()[0].state is WorkerState.STOPPED
+
+
+@pytest.mark.asyncio
+async def test_worker_supervisor_propagates_stop_caller_cancellation() -> None:
+    stopping = asyncio.Event()
+    release = asyncio.Event()
+
+    async def waits_during_stop(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+        stopping.set()
+        await release.wait()
+
+    supervisor = WorkerSupervisor()
+    supervisor.register(WorkerSpec("waits_during_stop", waits_during_stop))
+    await supervisor.start_all()
+
+    stop_task = asyncio.create_task(supervisor.stop_all())
+    await stopping.wait()
+    stop_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await stop_task
+
+    release.set()
+    await asyncio.sleep(0)
+    assert await supervisor.stop_all() == []
+    assert supervisor.statuses()[0].state is WorkerState.STOPPED
+
+
+@pytest.mark.asyncio
 async def test_worker_timeout_cancels_task_and_returns_safe_error() -> None:
     cancelled = asyncio.Event()
 
@@ -147,18 +189,17 @@ async def test_worker_failure_during_stop_is_aggregated() -> None:
 
 
 @pytest.mark.asyncio
-async def test_worker_ignoring_first_cancel_cannot_hang_shutdown() -> None:
+async def test_worker_ignoring_cancel_keeps_shutdown_retryable_until_terminal() -> None:
     cancel_count = 0
+    release = asyncio.Event()
 
     async def ignores_first_cancel(stop_event: asyncio.Event) -> None:
         nonlocal cancel_count
-        while True:
-            try:
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                cancel_count += 1
-                if cancel_count >= 2:
-                    raise
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancel_count += 1
+            await release.wait()
 
     supervisor = WorkerSupervisor()
     supervisor.register(
@@ -173,8 +214,50 @@ async def test_worker_ignoring_first_cancel_cannot_hang_shutdown() -> None:
     elapsed = asyncio.get_running_loop().time() - started_at
 
     assert errors == ["worker_stop_timeout:cancel_resistant"]
-    assert cancel_count >= 2
+    assert cancel_count == 1
     assert elapsed < 0.1
+    assert supervisor.shutdown_complete is False
+
+    assert await supervisor.stop_all() == ["worker_stop_timeout:cancel_resistant"]
+    assert cancel_count == 1
+
+    release.set()
+    await asyncio.sleep(0)
+    assert await supervisor.stop_all() == ["worker_stop_timeout:cancel_resistant"]
+    assert supervisor.shutdown_complete is True
+    status = supervisor.statuses()[0]
+    assert status.state is WorkerState.FAILED
+    assert status.error == "worker_stop_timeout"
+
+
+@pytest.mark.asyncio
+async def test_optional_pending_worker_reports_timeout_until_task_is_terminal() -> None:
+    release = asyncio.Event()
+
+    async def resistant_optional(stop_event: asyncio.Event) -> None:
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            await release.wait()
+
+    supervisor = WorkerSupervisor()
+    supervisor.register(
+        WorkerSpec(
+            "optional_pending",
+            resistant_optional,
+            required=False,
+            shutdown_timeout_seconds=0.01,
+        )
+    )
+    await supervisor.start_all()
+
+    assert await supervisor.stop_all() == ["worker_stop_timeout:optional_pending"]
+    assert supervisor.shutdown_complete is False
+
+    release.set()
+    await asyncio.sleep(0)
+    assert await supervisor.stop_all() == []
+    assert supervisor.shutdown_complete is True
 
 
 @pytest.mark.asyncio
@@ -202,6 +285,29 @@ async def test_status_listener_receives_immutable_transitions_and_is_isolated() 
     ]
     with pytest.raises(AttributeError):
         observed[-1].error = "changed"  # type: ignore[misc]
+
+
+@pytest.mark.asyncio
+async def test_status_listener_cancelled_error_is_isolated() -> None:
+    observed: list[WorkerState] = []
+
+    def listener(status: WorkerStatus) -> None:
+        observed.append(status.state)
+        raise asyncio.CancelledError
+
+    async def runner(stop_event: asyncio.Event) -> None:
+        await stop_event.wait()
+
+    supervisor = WorkerSupervisor(status_listener=listener)
+    supervisor.register(WorkerSpec("listener_cancelled", runner))
+
+    await supervisor.start_all()
+    assert await supervisor.stop_all() == []
+    assert observed == [
+        WorkerState.REGISTERED,
+        WorkerState.RUNNING,
+        WorkerState.STOPPED,
+    ]
 
 
 @pytest.mark.asyncio

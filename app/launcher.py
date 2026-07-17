@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import asyncio
 
-from app.bootstrap import build_runtime
-from app.routes import create_chat_router
+from app.agent_applications import registered_agent_runs
+from app.bootstrap import build_runtime, create_runtime_application
 from app.worker import run_worker
-from nexus_kernel.gateway import create_app
 from nexus_kernel.observability import configure_logging
 
 
 def main() -> None:
-    runtime = build_runtime()
+    runtime = build_runtime(
+        agent_runs_registration=registered_agent_runs,
+    )
     configure_logging(
         level=runtime.settings.logging.level,
         serialize=runtime.settings.logging.serialize,
@@ -23,15 +24,7 @@ def main() -> None:
 
     import uvicorn
 
-    routers = (
-        (create_chat_router(runtime.chat_service),) if runtime.chat_enabled else ()
-    )
-    application = create_app(
-        settings=runtime.settings,
-        kernel=runtime.kernel,
-        routers=routers,
-        metrics=runtime.metrics,
-    )
+    application = create_runtime_application(runtime)
     uvicorn.run(
         application,
         host=runtime.settings.server.host,
