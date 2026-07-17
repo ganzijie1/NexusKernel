@@ -5,8 +5,11 @@ from pathlib import Path
 
 import yaml
 
+from tests.project_contract import load_project_contract
+
 
 ROOT = Path(__file__).resolve().parents[2]
+PROJECT = load_project_contract(ROOT)
 REQUIRED_DOCS = (
     "README.md",
     "docs/architecture.md",
@@ -46,7 +49,7 @@ def test_project_guidance_is_chinese_and_complete() -> None:
         assert CJK.search(content), relative_path
         combined += content
     assert "nexus_kernel" in combined
-    assert "NEXUS_KERNEL" in combined
+    assert PROJECT.env_prefix in combined
 
 
 def test_python_version_policy_is_consistent_in_guidance_and_skills() -> None:
@@ -76,9 +79,12 @@ def test_project_markdown_relative_links_resolve() -> None:
 
 def test_guidance_documents_hardening_contracts() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    architecture = (ROOT / "docs/architecture.md").read_text(encoding="utf-8")
     development = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     configuration = (ROOT / "docs/configuration.md").read_text(encoding="utf-8")
+    api = (ROOT / "docs/api.md").read_text(encoding="utf-8")
     security = (ROOT / "docs/security.md").read_text(encoding="utf-8")
+    migration = (ROOT / "docs/migration-0.2.md").read_text(encoding="utf-8")
     audit = (ROOT / "docs/extraction-audit.md").read_text(encoding="utf-8")
     docker = (ROOT / "docker/README.md").read_text(encoding="utf-8")
 
@@ -86,9 +92,21 @@ def test_guidance_documents_hardening_contracts() -> None:
     assert "目标项目的 `pyproject.toml`" in readme + development
     assert "security-test-fixture" in security
     assert "同一行" in security
+    assert "解析失败时必须失败关闭" in security
     assert "不跳过整个 `tests/`" in security + audit
     assert "未知顶层目录" in development + audit
     assert "已配置、待执行验证" in docker
+    assert "REGISTERED" in architecture + migration
+    assert "handler(arguments, identity)" in development + api + migration
+    assert "complete_cleanup" in migration
+    assert "cleanup task 创建" in architecture + migration
+    assert "晚到" in architecture + migration
+    assert "Mount 前缀子树" in architecture
+    assert "渐进式流式" in architecture + api
+    assert "NTFS ACL" in security
+    assert "METADATA/WHEEL 单值字段" in readme + development
+    assert "build tag" in readme + development
+    assert "no-new-privileges" in docker
 
 
 def test_readme_documents_complete_framework_and_module_contract() -> None:
@@ -109,7 +127,7 @@ def test_readme_documents_complete_framework_and_module_contract() -> None:
         "optional_provider()",
         "Module.get_worker_specs()",
         "PostgreSQL",
-        "NEXUS_KERNEL_RUNTIME_EXTRAS",
+        PROJECT.environment_name("RUNTIME_EXTRAS"),
         "`pyproject.toml` 是唯一依赖来源",
         "不维护 `requirements.txt`",
     )
@@ -119,6 +137,7 @@ def test_readme_documents_complete_framework_and_module_contract() -> None:
 
 
 def test_guidance_documents_optional_infrastructure_installation_contract() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
     configuration = (ROOT / "docs/configuration.md").read_text(encoding="utf-8")
     development = (ROOT / "docs/development.md").read_text(encoding="utf-8")
     docker = (ROOT / "docker/README.md").read_text(encoding="utf-8")
@@ -127,9 +146,21 @@ def test_guidance_documents_optional_infrastructure_installation_contract() -> N
 
     assert "postgres" in combined
     assert "asyncpg" in combined
-    assert "NEXUS_KERNEL_RUNTIME_EXTRAS" in docker
+    assert PROJECT.environment_name("RUNTIME_EXTRAS") in docker
     assert "传递依赖" in configuration
     assert "requirements.txt" in configuration
+    assert not any(
+        line.startswith('python -m pip install --editable ".[mongo')
+        for line in readme.splitlines()
+    )
+    assert all(
+        interpreter in readme
+        for interpreter in (
+            ".venv-linux/bin/python -m pip install",
+            ".venv-macos/bin/python -m pip install",
+            ".\\.venv-win\\Scripts\\python.exe -m pip install",
+        )
+    )
 
 
 def test_project_skills_include_hardening_boundaries() -> None:
@@ -158,8 +189,17 @@ def test_project_skills_include_hardening_boundaries() -> None:
     assert "get_worker_specs" in module_skill
     assert "config/providers.yaml" in config_skill
     assert "postgres" in config_skill
-    assert "NEXUS_KERNEL_RUNTIME_EXTRAS" in delivery_skill
+    assert "RUNTIME_EXTRAS" in delivery_skill
     assert "Requires-Dist" in delivery_skill
+    assert "build tag" in delivery_skill
+    assert "REGISTERED" in module_skill
+    assert "Mount 前缀子树" in module_skill
+    assert "arguments, identity" in ai_skill
+    assert "complete_cleanup" in ai_skill
+    assert "LITELLM_LOCAL_MODEL_COST_MAP" in config_skill
+    assert "dev、preprod、prod" in config_skill
+    assert "<ENV_PREFIX>_RUNTIME_EXTRAS" in delivery_skill
+    assert "UID/GID 10001" in delivery_skill
 
 
 def test_agents_file_is_concise_and_preserves_core_rules() -> None:

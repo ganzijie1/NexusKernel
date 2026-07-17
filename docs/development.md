@@ -37,8 +37,15 @@ ApplicationRuntime 在 Kernel 启动后注册可运行模块的 Worker。
 
 Provider 只实现 `start`、`health_check`、`close`，由 app 装配 `ProviderSpec`。
 必需 Provider 失败阻断启动；可选 Provider 自身失败为 `FAILED`，依赖它的 Module 在仍可
-运行时为 `DEGRADED`。Worker 通过 WorkerSpec 注册，必须协作响应 stop event 和任务取消；
-API 角色不注册或启动 Worker。状态 listener 不得抛出异常影响 Supervisor。
+运行时为 `DEGRADED`；`required=True, enabled=False` 在配置和合同层都无效。factory 返回
+candidate 后即把所有权交给 Registry；仅签名合法的异步 `close()` 在后续校验、start、
+timeout 或取消失败时获得独立预算内单次清理保证。同步、缺失或签名非法的 close 不调用，
+并报告 `provider_cleanup_unavailable`。Worker 通过 WorkerSpec 注册，必须协作响应 stop
+event 和任务取消；API 角色不注册或启动 Worker。状态 listener（包括其主动抛出的
+`CancelledError`）不得影响 Supervisor。
+
+Module/Worker 停止超时不代表 task 已终止。框架保留原 task 及其依赖，显式重试复用该
+task；只有 task 达到真实终态后才能继续关闭 Provider。需要硬终止能力时使用独立进程。
 
 ## 基础设施适配器
 
@@ -55,11 +62,35 @@ API 角色不注册或启动 Worker。状态 listener 不得抛出异常影响 S
 普通 completion 适配器实现 ModelClient；SDK 自己管理 agent loop、session 和工具执行时
 实现 AgentRuntime。所有实现都必须归一化 ChatResponse/TokenUsage、设置超时、关闭
 资源，并将 SDK 异常转换为不包含原始响应的稳定错误。
+SDK 适配器构造函数必须无网络且不导入重型可选 SDK；幂等异步 `start()` 负责导入和创建
+client，直接 `chat/run` 也只能复用同一个 start task。ModelClient 的 `chat()` 必须使用
+关键字参数 `identity`；AgentRuntime 的 `run()` 身份参数保持现有合同。
 
 业务工具由 app 注册 AgentToolSpec。参数使用 Draft 2020-12 JSON Schema 完整校验；结果
-必须是严格 JSON。默认单工具 10 秒、最多 4 轮、每请求最多 16 次 handler、单结果最多
-65,536 UTF-8 bytes。同步 handler 在线程中运行，timeout 无法撤销线程已发生的副作用，
-所以副作用工具必须幂等并接受可信 `AgentIdentity` 授权。请求体不再接受 `user_id`。
+必须是严格 JSON。默认单工具 10 秒、最多 4 轮、每请求最多 16 次 handler，单参数和单结果
+各最多 65,536 UTF-8 bytes；同一绝对 deadline 覆盖有界参数遍历、Schema、handler 与
+增量结果编码。同步 handler 在线程中运行，timeout 无法撤销线程已发生的副作用，所以
+副作用工具必须幂等。所有 handler 固定为 `handler(arguments, identity)`，并使用可信
+`AgentIdentity` 授权；不得从 arguments、session 或请求正文重建身份。请求体不再接受
+`user_id`。
+
+多智能体定义同样归 app，并通过启动时冻结的 `AdkApplicationSpec` 注册表交给
+WorkflowRuntime。Graph 中的 LLM 节点固定为 `single_turn`，Team 只允许 coordinator 加
+不嵌套的 leaf `task`/`single_turn` Agent。每次 factory 创建独立 ADK App，但复用运行时
+模型与绑定可信身份的 ToolExecutor；不能让客户端提交指令、拓扑、工具名、模型或类路径。
+首版禁止循环、嵌套/动态 Workflow、有副作用的原生 FunctionTool 和并行 task 委派。
+
+启用 Agent Runs 前先由 app 显式注入非空 `agent_applications` 注册表，再设置
+`NEXUS_KERNEL_AGENT_RUNS_ENABLED=true`；仅设置环境开关会在启动期失败。仓库内的
+`default_adk_applications()` 只用于本地验证，不会被生产启动器自动加载。
+所有标准入口从 `app.agent_applications.registered_agent_runs()` 获取生产定义、工具、授权
+和可选可信身份解析器；业务应用应在该代码边界装配指令、工具 allowlist、访问策略与
+graph/team 工厂。入口把该函数作为 lazy factory 交给 bootstrap；只有 API 角色且模块启用
+时才求值，Worker 不得主动构造 Agent Runs 注册表。
+创建与恢复请求必须实现幂等，副作用 handler 还需使用业务幂等键，因为恢复按至少一次语义
+执行。默认存储是进程内实现，开发多副本时必须使用粘性路由，不能把它当作持久任务队列。
+新增状态或 phase 结果时必须同时扩展 MetricsRegistry 的固定 allowlist；不得把主体、
+agent、run、session、Prompt、工具载荷或异常原文加入指标标签。
 
 ## 开发流程
 
@@ -69,5 +100,8 @@ API 角色不注册或启动 Worker。状态 listener 不得抛出异常影响 S
 开发与测试支持 Python 3.11-3.13；Ruff 和 mypy 保持以最低版本 3.11 为目标。
 交付 wheel 时使用 `python -m build --wheel --outdir dist`，随后运行
 `python scripts/verify_wheel.py dist`。校验器读取目标项目的 `pyproject.toml`，并核对
-文件名、METADATA、WHEEL、RECORD、CRC、唯一 dist-info 与允许的顶层目录；不得跳过
-旧包、未知顶层目录和敏感文件检查。构建前清理 `build`、`dist` 和 `*.egg-info`。
+文件名、METADATA/WHEEL 单值字段基数、互不重复的 Tag 值、RECORD、CRC、唯一 dist-info
+与允许的顶层目录；Tag 集合必须匹配文件名。文件名含 build tag 时 `WHEEL` 必须有且
+仅有一个规范化后匹配的 `Build`，否则该字段必须省略。RECORD 摘要和大小必须匹配实际
+字节。不得跳过旧包、未知顶层目录和敏感文件检查。构建前清理 `build`、`dist` 和
+`*.egg-info`。

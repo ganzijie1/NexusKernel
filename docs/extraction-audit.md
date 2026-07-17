@@ -7,10 +7,10 @@
 | --- | --- | --- |
 | 模块拓扑、回滚、逆序停止 | Module、Protocol API 代理、Kernel 状态机 | `nexus_kernel/kernel` 与 Kernel 测试 |
 | 严格配置与动态加载 | 重复键/未知字段/变量/类路径 fail-fast | `nexus_kernel/config` 与配置测试 |
-| Provider 生命周期 | required/optional、健康、降级、关闭 | `nexus_kernel/providers` 与 Registry 测试 |
+| Provider 生命周期 | required/optional、candidate 接管、deadline、健康、降级、单次关闭 | `nexus_kernel/providers` 与 Registry 测试 |
 | EventBus、请求上下文、Worker | 独立运行时原语与协作停止 | `nexus_kernel/runtime` 与运行时测试 |
-| 多模型与服务端工具 | ModelClient、AgentRuntime、AgentToolSpec、usage | `nexus_kernel/ai` 与 SDK fake 测试 |
-| Gateway 与指标容错 | envelope、ID、限制、超时、OpenAPI、低基数指标 | `nexus_kernel/gateway` 与 Gateway 测试 |
+| 多模型与服务端工具 | 可信 identity、lazy SDK、Tool 预算、session tombstone、usage | `nexus_kernel/ai` 与 SDK fake 测试 |
+| Gateway 与指标容错 | envelope、ID、慢正文截止时间、匹配集合冲突、OpenAPI、低基数指标 | `nexus_kernel/gateway` 与 Gateway 测试 |
 | Mongo/Redis/PostgreSQL/Qdrant/OTel | 独立 extra、基础连接能力和按需加载适配器 | `nexus_kernel/infrastructure` 与合同测试 |
 | Docker/CI | 单镜像双角色、非 root、Python 3.11-3.13 测试矩阵、动态 wheel 合同、无自动部署 | `docker`、`.gitlab-ci.yml` 与部署测试 |
 
@@ -22,4 +22,6 @@
 
 完整验证包括 AST 依赖合同、初始化临时副本、安全扫描和 README 中的质量门禁。安全扫描
 不跳过整个 `tests/`，只接受测试目录内同行 fixture 豁免；wheel 校验从初始化后项目的
-元数据建立合同，拒绝未知顶层目录、重复条目、路径穿越、CRC 损坏和不一致的 dist-info。
+元数据建立合同，拒绝未知顶层目录、重复条目、路径穿越、CRC 损坏、不一致的 dist-info、
+重复单值字段和与文件名不匹配的 Tag。初始化器还在写入前验证精确 env profile 集合，并在
+隔离副本运行非真实 LLM 测试、安全扫描、Compose 解析与真实 wheel 构建校验。
