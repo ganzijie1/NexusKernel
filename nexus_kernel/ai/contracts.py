@@ -10,11 +10,11 @@ from types import MappingProxyType
 from typing import Any, Literal, Protocol, TypeAlias
 
 from jsonschema.validators import Draft202012Validator  # type: ignore[import-untyped]
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 ProviderId: TypeAlias = Literal["openai_compatible", "litellm", "google_adk"]
-ToolHandler: TypeAlias = Callable[[dict[str, Any]], Any | Awaitable[Any]]
+_STABLE_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 
 
 class _StrictModel(BaseModel):
@@ -31,6 +31,13 @@ class ChatMessage(_StrictModel):
 class ChatRequest(_StrictModel):
     messages: list[ChatMessage] = Field(min_length=1, max_length=100)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            _validate_session_id(value)
+        return value
 
     @model_validator(mode="after")
     def validate_conversation(self) -> ChatRequest:
@@ -81,14 +88,12 @@ class ChatResponse(_StrictModel):
 
 
 def _validate_identifier(value: str, field: str) -> None:
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value) > 128
-        or "\n" in value
-        or "\r" in value
-    ):
-        raise ValueError(f"{field} must be a non-empty single-line identifier")
+    if not isinstance(value, str) or _STABLE_IDENTIFIER.fullmatch(value) is None:
+        raise ValueError(f"{field} must be a stable ASCII identifier")
+
+
+def _validate_session_id(value: str) -> None:
+    _validate_identifier(value, "session_id")
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,6 +104,9 @@ class AgentIdentity:
         _validate_identifier(self.principal_id, "principal_id")
 
 
+ToolHandler: TypeAlias = Callable[[dict[str, Any], AgentIdentity], Any | Awaitable[Any]]
+
+
 @dataclass(frozen=True, slots=True)
 class SessionKey:
     principal_id: str
@@ -106,7 +114,7 @@ class SessionKey:
 
     def __post_init__(self) -> None:
         _validate_identifier(self.principal_id, "principal_id")
-        _validate_identifier(self.session_id, "session_id")
+        _validate_session_id(self.session_id)
 
 
 def _freeze_json(value: Any) -> Any:
@@ -158,6 +166,8 @@ class ModelClient(Protocol):
     async def chat(
         self,
         request: ChatRequest,
+        *,
+        identity: AgentIdentity,
         tools: Sequence[AgentToolSpec] = (),
     ) -> ChatResponse: ...
 

@@ -30,11 +30,13 @@ class ChatModuleConfig(ModuleConfig):
     tool_timeout_seconds: float = Field(default=10.0, gt=0)
     max_tool_rounds: int = Field(default=4, ge=1, le=16)
     max_tool_calls: int = Field(default=16, ge=1, le=128)
+    max_tool_argument_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     max_tool_result_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     adk_app_name: str = Field(default="nexus_kernel", pattern=r"^[a-z][a-z0-9_]*$")
     adk_session_ttl_seconds: float = Field(default=1800.0, gt=0)
     adk_session_max_entries: int = Field(default=256, ge=1, le=10_000)
     adk_session_max_events: int = Field(default=200, ge=2, le=2000)
+    adk_session_cleanup_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
 
     @field_validator("service_bearer_token", "ai_api_key", mode="before")
     @classmethod
@@ -59,6 +61,8 @@ class ChatModuleConfig(ModuleConfig):
     def validate_deadlines(self) -> ChatModuleConfig:
         if self.tool_timeout_seconds > self.timeout_seconds:
             raise ValueError("tool timeout must not exceed the AI timeout")
+        if self.adk_session_cleanup_timeout_seconds > self.timeout_seconds:
+            raise ValueError("session cleanup timeout must not exceed the AI timeout")
         return self
 
 
@@ -90,6 +94,7 @@ def create_ai_runtime(
             tool_timeout_seconds=config.tool_timeout_seconds,
             max_tool_rounds=config.max_tool_rounds,
             max_tool_calls=config.max_tool_calls,
+            max_tool_argument_bytes=config.max_tool_argument_bytes,
             max_tool_result_bytes=config.max_tool_result_bytes,
         )
     if config.provider_id == "litellm":
@@ -101,6 +106,7 @@ def create_ai_runtime(
             tool_timeout_seconds=config.tool_timeout_seconds,
             max_tool_rounds=config.max_tool_rounds,
             max_tool_calls=config.max_tool_calls,
+            max_tool_argument_bytes=config.max_tool_argument_bytes,
             max_tool_result_bytes=config.max_tool_result_bytes,
         )
     return GoogleAdkRuntime(
@@ -111,10 +117,12 @@ def create_ai_runtime(
         tool_timeout_seconds=config.tool_timeout_seconds,
         max_tool_rounds=config.max_tool_rounds,
         max_tool_calls=config.max_tool_calls,
+        max_tool_argument_bytes=config.max_tool_argument_bytes,
         max_tool_result_bytes=config.max_tool_result_bytes,
         adk_app_name=config.adk_app_name,
         session_ttl_seconds=config.adk_session_ttl_seconds,
         session_max_entries=config.adk_session_max_entries,
         session_max_events=config.adk_session_max_events,
+        session_cleanup_timeout_seconds=(config.adk_session_cleanup_timeout_seconds),
         session_store=session_store,
     )

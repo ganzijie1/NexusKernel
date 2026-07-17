@@ -13,3 +13,7 @@ class AiTimeoutError(AiProviderError):
 
 class AiToolError(AiProviderError):
     """Raised when a registered server tool cannot be executed safely."""
+
+
+class AiWorkflowActionUnsupportedError(AiProviderError):
+    """Raised when a workflow requests an unregistered interactive action."""

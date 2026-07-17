@@ -70,7 +70,11 @@ class AppChatService:
             chat = getattr(runtime, "chat", None)
             if callable(chat):
                 client = cast(ModelClient, runtime)
-                return await client.chat(request, self._tools)
+                return await client.chat(
+                    request,
+                    identity=identity,
+                    tools=self._tools,
+                )
             run = getattr(runtime, "run", None)
             if callable(run):
                 agent = cast(AgentRuntime, runtime)

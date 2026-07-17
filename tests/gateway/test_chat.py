@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
 
@@ -9,6 +11,7 @@ from app.routes.chat import create_chat_router
 from app.services.chat import AppChatService
 from nexus_kernel.ai import (
     AgentIdentity,
+    AiProviderError,
     AiTimeoutError,
     ChatMessage,
     ChatRequest,
@@ -26,6 +29,7 @@ class FakeModelClient:
 
     def __init__(self) -> None:
         self.closed = False
+        self.calls: list[dict[str, Any]] = []
 
     async def start(self) -> None:
         return None
@@ -34,8 +38,14 @@ class FakeModelClient:
         return True
 
     async def chat(
-        self, request: ChatRequest, tools: tuple[Any, ...] = ()
+        self,
+        request: ChatRequest,
+        *,
+        identity: AgentIdentity,
+        tools: tuple[Any, ...] = (),
     ) -> ChatResponse:
+        await asyncio.sleep(0)
+        self.calls.append({"identity": identity, "tools": tools})
         return ChatResponse(
             message=ChatMessage(role="assistant", content="safe answer"),
             usage=TokenUsage(input_tokens=2, output_tokens=3, total_tokens=5),
@@ -69,6 +79,7 @@ class FakeAgentRuntime:
         session_id: str | None = None,
         tools: tuple[Any, ...] = (),
     ) -> ChatResponse:
+        await asyncio.sleep(0)
         self.calls.append(
             {"identity": identity, "session_id": session_id, "tools": tools}
         )
@@ -91,6 +102,11 @@ class TenantResolver:
 
     async def resolve(self, request: Request) -> AgentIdentity:
         return AgentIdentity(self.principal_id)
+
+
+class HeaderTenantResolver:
+    async def resolve(self, request: Request) -> AgentIdentity:
+        return AgentIdentity(request.headers["x-tenant"])
 
 
 def _settings() -> ApplicationSettings:
@@ -172,6 +188,7 @@ def test_chat_success_and_ready_degradation_without_credentials() -> None:
     assert response.status_code == 200
     assert response.json()["data"]["message"]["content"] == "safe answer"
     assert response.json()["data"]["usage"]["total_tokens"] == 5
+    assert model.calls == [{"identity": AgentIdentity("service"), "tools": ()}]
     assert model.closed is True
 
     degraded_registry = ProviderRegistry()
@@ -296,6 +313,83 @@ def test_chat_maps_timeout_to_504_without_cause_details() -> None:
     assert "private upstream detail" not in response.text
 
 
+def test_chat_maps_provider_tool_or_store_failure_to_safe_503() -> None:
+    agent = FakeAgentRuntime(AiProviderError("private provider detail"))
+    registry = ProviderRegistry()
+    registry.register(ProviderSpec("ai_runtime", lambda: agent, required=False))
+    service = AppChatService(
+        registry, identity_resolver=TenantResolver("trusted-tenant")
+    )
+    app = create_app(
+        settings=_settings(),
+        kernel=Kernel([], providers=registry),
+        routers=(create_chat_router(service),),
+    )
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/api/v1/chat",
+            json={"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "ai_provider_unavailable"
+    assert "private provider detail" not in response.text
+
+
+def _tenant_request(tenant: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/v1/chat",
+            "headers": [(b"x-tenant", tenant.encode("ascii"))],
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_tenants_remain_isolated_on_both_ai_dispatch_paths() -> None:
+    request = ChatRequest(
+        messages=[ChatMessage(role="user", content="hello")],
+        session_id="shared-session",
+    )
+
+    model = FakeModelClient()
+    model_registry = ProviderRegistry()
+    model_registry.register(ProviderSpec("ai_runtime", lambda: model))
+    await model_registry.initialize_all()
+    model_service = AppChatService(
+        model_registry, identity_resolver=HeaderTenantResolver()
+    )
+    await asyncio.gather(
+        model_service.chat(request, _tenant_request("tenant-a")),
+        model_service.chat(request, _tenant_request("tenant-b")),
+    )
+    await model_registry.close_all()
+
+    agent = FakeAgentRuntime()
+    agent_registry = ProviderRegistry()
+    agent_registry.register(ProviderSpec("ai_runtime", lambda: agent))
+    await agent_registry.initialize_all()
+    agent_service = AppChatService(
+        agent_registry, identity_resolver=HeaderTenantResolver()
+    )
+    await asyncio.gather(
+        agent_service.chat(request, _tenant_request("tenant-a")),
+        agent_service.chat(request, _tenant_request("tenant-b")),
+    )
+    await agent_registry.close_all()
+
+    assert {call["identity"] for call in model.calls} == {
+        AgentIdentity("tenant-a"),
+        AgentIdentity("tenant-b"),
+    }
+    assert {(call["identity"], call["session_id"]) for call in agent.calls} == {
+        (AgentIdentity("tenant-a"), "shared-session"),
+        (AgentIdentity("tenant-b"), "shared-session"),
+    }
+
+
 def test_chat_rejects_unsupported_message_shapes_and_coercion() -> None:
     model = FakeModelClient()
     registry = ProviderRegistry()
@@ -327,5 +421,16 @@ def test_chat_rejects_unsupported_message_shapes_and_coercion() -> None:
             client.post("/api/v1/chat", json={"messages": messages})
             for messages in invalid_messages
         ]
+        invalid_sessions = [
+            client.post(
+                "/api/v1/chat",
+                json={
+                    "session_id": session_id,
+                    "messages": [{"role": "user", "content": "question"}],
+                },
+            )
+            for session_id in ("line\nbreak", "has space", "non-ascii-会话")
+        ]
 
     assert [response.status_code for response in responses] == [422, 422, 422, 422]
+    assert [response.status_code for response in invalid_sessions] == [422, 422, 422]

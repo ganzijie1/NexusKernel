@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from nexus_kernel.ai import (
+    AgentIdentity,
     AgentToolSpec,
     AiProviderError,
     AiTimeoutError,
@@ -15,6 +16,9 @@ from nexus_kernel.ai import (
     ChatRequest,
     OpenAICompatibleClient,
 )
+
+
+_IDENTITY = AgentIdentity("trusted-user")
 
 
 class FakeCompletions:
@@ -91,7 +95,10 @@ async def test_openai_maps_messages_tools_executes_calls_and_sums_usage() -> Non
     )
     tool_calls: list[str] = []
 
-    async def lookup_weather(arguments: dict[str, Any]) -> dict[str, str]:
+    async def lookup_weather(
+        arguments: dict[str, Any], identity: AgentIdentity
+    ) -> dict[str, str]:
+        assert identity == _IDENTITY
         tool_calls.append(arguments["city"])
         return {"weather": "sunny"}
 
@@ -121,6 +128,7 @@ async def test_openai_maps_messages_tools_executes_calls_and_sums_usage() -> Non
                 ChatMessage(role="user", content="weather?"),
             ]
         ),
+        identity=_IDENTITY,
         tools=(tool,),
     )
 
@@ -157,7 +165,8 @@ async def test_openai_normalizes_timeout_and_provider_error_without_secrets() ->
     )
     with pytest.raises(AiTimeoutError):
         await timeout_client.chat(
-            ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+            ChatRequest(messages=[ChatMessage(role="user", content="hello")]),
+            identity=_IDENTITY,
         )
 
     broken_client = OpenAICompatibleClient(
@@ -167,7 +176,8 @@ async def test_openai_normalizes_timeout_and_provider_error_without_secrets() ->
     )
     with pytest.raises(AiProviderError) as captured:
         await broken_client.chat(
-            ChatRequest(messages=[ChatMessage(role="user", content="private")])
+            ChatRequest(messages=[ChatMessage(role="user", content="private")]),
+            identity=_IDENTITY,
         )
     assert "must-not-leak" not in str(captured.value)
     assert "private" not in str(captured.value)
@@ -197,11 +207,11 @@ async def test_openai_rejects_invalid_usage_and_recovers_health() -> None:
     request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])
 
     with pytest.raises(AiProviderError) as captured:
-        await client.chat(request)
+        await client.chat(request, identity=_IDENTITY)
     assert captured.value.__cause__ is None
     assert await client.health_check() is False
 
-    response = await client.chat(request)
+    response = await client.chat(request, identity=_IDENTITY)
     assert response.message.content == "good"
     assert await client.health_check() is True
 
@@ -216,7 +226,8 @@ async def test_openai_rejects_whitespace_only_response() -> None:
 
     with pytest.raises(AiProviderError, match="no text"):
         await client.chat(
-            ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+            ChatRequest(messages=[ChatMessage(role="user", content="hello")]),
+            identity=_IDENTITY,
         )
 
 
@@ -224,7 +235,10 @@ async def test_openai_rejects_whitespace_only_response() -> None:
 async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None:
     handler_calls: list[int] = []
 
-    async def handler(arguments: dict[str, Any]) -> dict[str, int]:
+    async def handler(
+        arguments: dict[str, Any], identity: AgentIdentity
+    ) -> dict[str, int]:
+        assert identity == _IDENTITY
         handler_calls.append(arguments["value"])
         return {"value": arguments["value"]}
 
@@ -259,7 +273,31 @@ async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None
     )
     request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])
     with pytest.raises(AiToolError):
-        await client.chat(request, (tool,))
+        await client.chat(request, identity=_IDENTITY, tools=(tool,))
+    assert handler_calls == []
+
+    for raw_arguments in (
+        '{"value":1,"value":2}',
+        '{"value":NaN}',
+        '{"value":1' + (" " * 100) + "}",
+    ):
+        strict_call = _response(
+            None,
+            tool_calls=[
+                {
+                    "id": "call-strict",
+                    "function": {"name": "lookup", "arguments": raw_arguments},
+                }
+            ],
+        )
+        strict_client = OpenAICompatibleClient(
+            api_key="secret",  # security-test-fixture
+            model="fake",
+            max_tool_argument_bytes=32,
+            client=FakeOpenAI([strict_call]),
+        )
+        with pytest.raises(AiToolError):
+            await strict_client.chat(request, identity=_IDENTITY, tools=(tool,))
     assert handler_calls == []
 
     batch = FakeOpenAI(
@@ -286,7 +324,7 @@ async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None
         client=batch,
     )
     with pytest.raises(AiToolError, match="budget"):
-        await limited.chat(request, (tool,))
+        await limited.chat(request, identity=_IDENTITY, tools=(tool,))
     assert handler_calls == []
 
     rounds = FakeOpenAI(
@@ -318,10 +356,12 @@ async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None
         client=rounds,
     )
     with pytest.raises(AiProviderError, match="round"):
-        await one_round.chat(request, (tool,))
+        await one_round.chat(request, identity=_IDENTITY, tools=(tool,))
     assert handler_calls == [1]
 
-    async def slow(arguments: dict[str, Any]) -> dict[str, bool]:
+    async def slow(
+        arguments: dict[str, Any], identity: AgentIdentity
+    ) -> dict[str, bool]:
         await asyncio.sleep(60)
         return {"ok": True}
 
@@ -342,14 +382,17 @@ async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None
         client=FakeOpenAI([tool_call]),
     )
     with pytest.raises(AiTimeoutError):
-        await timeout.chat(request, (slow_tool,))
+        await timeout.chat(request, identity=_IDENTITY, tools=(slow_tool,))
     assert await timeout.health_check() is True
+
+    async def large(arguments: dict[str, Any], identity: AgentIdentity) -> str:
+        return "x" * 100
 
     large_tool = AgentToolSpec(
         name="large",
         description="Return a large result.",
         parameters={"type": "object", "properties": {}},
-        handler=lambda arguments: "x" * 100,
+        handler=large,
     )
     large_call = _response(
         None,
@@ -362,7 +405,7 @@ async def test_openai_tool_schema_budget_round_timeout_and_size_limits() -> None
         client=FakeOpenAI([large_call]),
     )
     with pytest.raises(AiToolError, match="size"):
-        await oversized.chat(request, (large_tool,))
+        await oversized.chat(request, identity=_IDENTITY, tools=(large_tool,))
 
 
 @pytest.mark.asyncio
@@ -378,3 +421,104 @@ async def test_openai_close_is_concurrent_idempotent() -> None:
 
     assert fake.close_calls == 1
     assert await client.health_check() is False
+
+
+@pytest.mark.asyncio
+async def test_openai_constructor_defers_default_client_to_async_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    fake = FakeOpenAI([])
+
+    def create_client(client: OpenAICompatibleClient) -> FakeOpenAI:
+        events.append("create")
+        return fake
+
+    async def offload(function: Any, *args: Any) -> Any:
+        events.append("to_thread")
+        return function(*args)
+
+    monkeypatch.setattr(OpenAICompatibleClient, "_create_default_client", create_client)
+    monkeypatch.setattr("nexus_kernel.ai.openai_compatible.asyncio.to_thread", offload)
+
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="model",
+    )
+    assert events == []
+
+    await client.start()
+
+    assert events == ["to_thread", "create"]
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_request_deadline_includes_lazy_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    start_entered = asyncio.Event()
+    release_start = asyncio.Event()
+    fake = FakeOpenAI([_response("answer")])
+
+    async def offload(function: Any, *args: Any) -> FakeOpenAI:
+        start_entered.set()
+        await release_start.wait()
+        return fake
+
+    monkeypatch.setattr("nexus_kernel.ai.openai_compatible.asyncio.to_thread", offload)
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="model",
+        timeout_seconds=0.01,
+    )
+    request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+
+    with pytest.raises(AiTimeoutError):
+        await client.chat(request, identity=_IDENTITY)
+    assert start_entered.is_set()
+    assert await client.health_check() is False
+
+    release_start.set()
+    start_task = client._start_task
+    assert start_task is not None
+    await asyncio.wait_for(start_task, timeout=0.2)
+    response = await client.chat(request, identity=_IDENTITY)
+
+    assert response.message.content == "answer"
+    assert await client.health_check() is True
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_openai_close_drains_admitted_call_and_rejects_new_calls() -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_response() -> dict[str, Any]:
+        entered.set()
+        await release.wait()
+        return _response("answer")
+
+    fake = FakeOpenAI([slow_response])
+    client = OpenAICompatibleClient(
+        api_key="secret",  # security-test-fixture
+        model="model",
+        timeout_seconds=1,
+        client=fake,
+    )
+    request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])
+    running = asyncio.create_task(client.chat(request, identity=_IDENTITY))
+    await entered.wait()
+
+    closing = asyncio.create_task(client.close())
+    await asyncio.sleep(0)
+    with pytest.raises(AiProviderError, match="closed"):
+        await client.chat(request, identity=_IDENTITY)
+    assert fake.close_calls == 0
+
+    release.set()
+    response = await running
+    await closing
+    assert response.message.content == "answer"
+    assert fake.close_calls == 1

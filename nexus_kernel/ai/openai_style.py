@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
-from nexus_kernel.ai._closing import CloseCoordinator
+from nexus_kernel.ai._closing import (
+    ActiveCallGate,
+    CallAdmissionError,
+    CloseCoordinator,
+)
 from nexus_kernel.ai.contracts import (
     AgentToolSpec,
+    AgentIdentity,
     ChatMessage,
     ChatRequest,
     ChatResponse,
@@ -48,6 +52,7 @@ class OpenAIStyleClient(ABC):
         tool_timeout_seconds: float = 10.0,
         max_tool_rounds: int = 4,
         max_tool_calls: int = 16,
+        max_tool_argument_bytes: int = 65_536,
         max_tool_result_bytes: int = 65_536,
     ) -> None:
         if not model.strip():
@@ -60,6 +65,8 @@ class OpenAIStyleClient(ABC):
             raise ValueError("max_tool_rounds must be positive")
         if max_tool_calls < 1:
             raise ValueError("max_tool_calls must be positive")
+        if max_tool_argument_bytes < 1:
+            raise ValueError("max_tool_argument_bytes must be positive")
         if max_tool_result_bytes < 1:
             raise ValueError("max_tool_result_bytes must be positive")
         self.model = model
@@ -67,13 +74,15 @@ class OpenAIStyleClient(ABC):
         self.tool_timeout_seconds = tool_timeout_seconds
         self.max_tool_rounds = max_tool_rounds
         self.max_tool_calls = max_tool_calls
+        self.max_tool_argument_bytes = max_tool_argument_bytes
         self.max_tool_result_bytes = max_tool_result_bytes
         self._healthy = True
         self._close_coordinator = CloseCoordinator()
+        self._call_gate = ActiveCallGate()
 
     @property
     def _closed(self) -> bool:
-        return self._close_coordinator.unavailable
+        return self._close_coordinator.unavailable or self._call_gate.unavailable
 
     async def start(self) -> None:
         if self._closed:
@@ -85,19 +94,27 @@ class OpenAIStyleClient(ABC):
     async def chat(
         self,
         request: ChatRequest,
+        *,
+        identity: AgentIdentity,
         tools: Sequence[AgentToolSpec] = (),
     ) -> ChatResponse:
-        if self._closed:
-            raise AiProviderError("AI client is closed")
-        executor = ToolExecutor(
-            tools,
-            timeout_seconds=self.tool_timeout_seconds,
-            max_calls=self.max_tool_calls,
-            max_result_bytes=self.max_tool_result_bytes,
-        )
         try:
-            async with asyncio.timeout(self.timeout_seconds):
-                return await self._chat(request, executor)
+            deadline = asyncio.get_running_loop().time() + self.timeout_seconds
+            async with asyncio.timeout_at(deadline):
+                await self.start()
+                try:
+                    async with self._call_gate.admit():
+                        executor = ToolExecutor(
+                            tools,
+                            identity=identity,
+                            timeout_seconds=self.tool_timeout_seconds,
+                            max_calls=self.max_tool_calls,
+                            max_argument_bytes=self.max_tool_argument_bytes,
+                            max_result_bytes=self.max_tool_result_bytes,
+                        )
+                        return await self._chat(request, executor)
+                except CallAdmissionError:
+                    raise AiProviderError("AI client is closed") from None
         except asyncio.CancelledError:
             raise
         except TimeoutError:
@@ -244,7 +261,7 @@ class OpenAIStyleClient(ABC):
     async def _execute_tools(
         calls: list[Any], executor: ToolExecutor
     ) -> list[dict[str, Any]]:
-        parsed: list[tuple[str, str, dict[str, Any]]] = []
+        parsed: list[tuple[str, str, str]] = []
         for call in calls:
             function = _read(call, "function", {})
             name = _read(function, "name", "")
@@ -253,16 +270,11 @@ class OpenAIStyleClient(ABC):
                 raise AiToolError("AI provider requested an invalid tool")
             if not isinstance(call_id, str) or not call_id:
                 raise AiToolError("AI provider returned an invalid tool call")
-            try:
-                arguments = json.loads(str(_read(function, "arguments", "{}")))
-            except (TypeError, ValueError):
-                raise AiToolError(
-                    "AI provider supplied invalid tool arguments"
-                ) from None
-            if not isinstance(arguments, dict):
+            arguments = _read(function, "arguments", "{}")
+            if not isinstance(arguments, str):
                 raise AiToolError("AI provider supplied invalid tool arguments")
             parsed.append((call_id, name, arguments))
-        serialized = await executor.execute_json_batch(
+        serialized = await executor.execute_json_text_batch(
             [(name, arguments) for _, name, arguments in parsed]
         )
         return [
@@ -271,8 +283,13 @@ class OpenAIStyleClient(ABC):
         ]
 
     async def _coordinate_close(self, callback: Callable[[], Awaitable[None]]) -> None:
+        async def close_after_calls() -> None:
+            await self._call_gate.drain(self.timeout_seconds)
+            await callback()
+            self._call_gate.mark_closed()
+
         try:
-            await self._close_coordinator.close(callback)
+            await self._close_coordinator.close(close_after_calls)
         except asyncio.CancelledError:
             raise
         except Exception:

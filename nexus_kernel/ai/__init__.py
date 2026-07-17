@@ -1,5 +1,10 @@
 """Provider-neutral AI contracts and concrete SDK adapters."""
 
+from nexus_kernel.ai.adk_sessions import (
+    AdkSessionLease,
+    AdkSessionStore,
+    BoundedMemoryAdkSessionStore,
+)
 from nexus_kernel.ai.contracts import (
     AgentIdentity,
     AgentRuntime,
@@ -11,26 +16,47 @@ from nexus_kernel.ai.contracts import (
     ProviderId,
     SessionKey,
     TokenUsage,
+    ToolHandler,
 )
 from nexus_kernel.ai.errors import (
     AiProviderError,
     AiTimeoutError,
     AiToolError,
+    AiWorkflowActionUnsupportedError,
 )
 from nexus_kernel.ai.google_adk import (
     AdkBackend,
     AdkResult,
-    AdkSessionLease,
-    AdkSessionStore,
-    BoundedMemoryAdkSessionStore,
     GoogleAdkRuntime,
 )
 from nexus_kernel.ai.litellm_client import LiteLLMClient
 from nexus_kernel.ai.openai_compatible import OpenAICompatibleClient
 from nexus_kernel.ai.tool_executor import ToolExecutor
+from nexus_kernel.ai.workflows import (
+    AdkApplicationBuildContext,
+    AdkApplicationFactory,
+    AdkApplicationRegistry,
+    AdkApplicationSpec,
+    JsonValue,
+    WorkflowActionResponse,
+    WorkflowActionSpec,
+    WorkflowFunctionNodeSpec,
+    WorkflowInvocation,
+    WorkflowInvocationResult,
+    WorkflowNodeResult,
+    WorkflowPendingAction,
+    WorkflowRequestInputNodeSpec,
+    WorkflowRuntime,
+    WorkflowTransform,
+    WorkflowTransformNodeSpec,
+)
 
 __all__ = [
     "AdkBackend",
+    "AdkApplicationBuildContext",
+    "AdkApplicationFactory",
+    "AdkApplicationRegistry",
+    "AdkApplicationSpec",
     "AdkResult",
     "AdkSessionLease",
     "AdkSessionStore",
@@ -40,11 +66,13 @@ __all__ = [
     "AiProviderError",
     "AiTimeoutError",
     "AiToolError",
+    "AiWorkflowActionUnsupportedError",
     "BoundedMemoryAdkSessionStore",
     "ChatMessage",
     "ChatRequest",
     "ChatResponse",
     "GoogleAdkRuntime",
+    "JsonValue",
     "LiteLLMClient",
     "ModelClient",
     "OpenAICompatibleClient",
@@ -52,4 +80,16 @@ __all__ = [
     "SessionKey",
     "TokenUsage",
     "ToolExecutor",
+    "ToolHandler",
+    "WorkflowActionResponse",
+    "WorkflowActionSpec",
+    "WorkflowFunctionNodeSpec",
+    "WorkflowInvocation",
+    "WorkflowInvocationResult",
+    "WorkflowNodeResult",
+    "WorkflowPendingAction",
+    "WorkflowRequestInputNodeSpec",
+    "WorkflowRuntime",
+    "WorkflowTransform",
+    "WorkflowTransformNodeSpec",
 ]
