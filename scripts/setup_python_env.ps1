@@ -140,7 +140,7 @@ if ($createEnvironment) {
 
 Push-Location $projectRoot
 try {
-    Invoke-Python $environmentPython @("-m", "pip", "install", "--upgrade", "pip")
+    Invoke-Python $environmentPython @("-m", "pip", "--version")
     Invoke-Python $environmentPython @("-m", "pip", "install", "--editable", ".[ai,dev]")
     Invoke-Python $environmentPython @("-c", "import sys; print(sys.executable)")
 }

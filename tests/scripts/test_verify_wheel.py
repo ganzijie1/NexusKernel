@@ -94,6 +94,7 @@ def _write_wheel(
     extra_entries: tuple[str, ...] = (),
     omitted_dist_info: frozenset[str] = frozenset(),
     metadata: str | None = None,
+    wheel_metadata: str | None = None,
     duplicate_entry: str | None = None,
     compression: int = ZIP_DEFLATED,
 ) -> None:
@@ -102,7 +103,8 @@ def _write_wheel(
         "nexus_kernel/__init__.py": "",
         "app/__init__.py": "",
         f"{dist_info}/METADATA": metadata or _metadata(contract),
-        f"{dist_info}/WHEEL": (
+        f"{dist_info}/WHEEL": wheel_metadata
+        or (
             "Wheel-Version: 1.0\nGenerator: tests\n"
             "Root-Is-Purelib: true\nTag: py3-none-any\n\n"
         ),
@@ -133,10 +135,12 @@ def _wheel_path(
     *,
     filename_name: str | None = None,
     filename_version: str | None = None,
+    filename_build: str | None = None,
 ) -> Path:
     distribution = (filename_name or contract.distribution).replace("-", "_")
     version = filename_version or contract.version
-    return root / f"{distribution}-{version}-py3-none-any.whl"
+    build = f"-{filename_build}" if filename_build is not None else ""
+    return root / f"{distribution}-{version}{build}-py3-none-any.whl"
 
 
 def test_valid_wheel_uses_project_contract(tmp_path: Path) -> None:
@@ -151,6 +155,195 @@ def test_valid_wheel_uses_project_contract(tmp_path: Path) -> None:
     _write_wheel(wheel, contract)
 
     assert verify_wheel.validate_wheel(wheel, contract) == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["Metadata-Version", "Name", "Version", "Requires-Python"],
+)
+def test_wheel_rejects_missing_required_metadata_singleton(
+    tmp_path: Path, field: str
+) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract)
+    metadata = (
+        "\n".join(
+            line
+            for line in _metadata(contract).splitlines()
+            if not line.startswith(f"{field}:")
+        )
+        + "\n\n"
+    )
+    _write_wheel(wheel, contract, metadata=metadata)
+
+    assert f"exactly one {field}" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("Metadata-Version", "2.4"),
+        ("Name", "other-project"),
+        ("Version", "9.9.9"),
+        ("Requires-Python", ">=3.12"),
+    ],
+)
+def test_wheel_rejects_duplicate_metadata_singleton(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract)
+    metadata = _metadata(contract).replace(
+        f"{field}:", f"{field}: {value}\n{field}:", 1
+    )
+    _write_wheel(wheel, contract, metadata=metadata)
+
+    assert f"exactly one {field}" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
+
+
+def test_wheel_rejects_unsupported_metadata_version(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract)
+    metadata = _metadata(contract).replace(
+        "Metadata-Version: 2.4", "Metadata-Version: 9.9"
+    )
+    _write_wheel(wheel, contract, metadata=metadata)
+
+    assert "unsupported Metadata-Version" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
+
+
+@pytest.mark.parametrize(
+    ("wheel_metadata", "expected"),
+    [
+        (
+            "Generator: tests\nRoot-Is-Purelib: true\nTag: py3-none-any\n\n",
+            "exactly one Wheel-Version",
+        ),
+        (
+            "Wheel-Version: 1.0\nGenerator: tests\nTag: py3-none-any\n\n",
+            "exactly one Root-Is-Purelib",
+        ),
+        (
+            "Wheel-Version: 1.0\nWheel-Version: 1.0\nGenerator: tests\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n\n",
+            "exactly one Wheel-Version",
+        ),
+        (
+            "Wheel-Version: 1.0\nGenerator: first\nGenerator: second\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n\n",
+            "at most one Generator",
+        ),
+        (
+            "Wheel-Version: 1.0\nGenerator: tests\nBuild: 1\nBuild: 2\n"
+            "Root-Is-Purelib: true\nTag: py3-none-any\n\n",
+            "at most one Build",
+        ),
+    ],
+)
+def test_wheel_rejects_invalid_wheel_singleton_headers(
+    tmp_path: Path, wheel_metadata: str, expected: str
+) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract)
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert expected in "\n".join(verify_wheel.validate_wheel(wheel, contract))
+
+
+def test_wheel_rejects_repeated_equivalent_tag_headers(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract)
+    wheel_metadata = (
+        "Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
+        "Tag: py3-none-any\nTag: py3-none-any\n\n"
+    )
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert "duplicate Tag values" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
+
+
+def test_wheel_allows_multiple_unique_tags_matching_filename(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    distribution = contract.distribution.replace("-", "_")
+    wheel = tmp_path / f"{distribution}-{contract.version}-py2.py3-none-any.whl"
+    wheel_metadata = (
+        "Wheel-Version: 1.0\nGenerator: tests\nRoot-Is-Purelib: true\n"
+        "Tag: py2-none-any\nTag: py3-none-any\n\n"
+    )
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert verify_wheel.validate_wheel(wheel, contract) == []
+
+
+def test_wheel_accepts_matching_normalized_build_tag(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract, filename_build="01alpha")
+    wheel_metadata = (
+        "Wheel-Version: 1.0\nGenerator: tests\nBuild: 1alpha\n"
+        "Root-Is-Purelib: true\nTag: py3-none-any\n\n"
+    )
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert verify_wheel.validate_wheel(wheel, contract) == []
+
+
+def test_wheel_rejects_missing_build_header_for_filename_tag(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract, filename_build="1")
+    _write_wheel(wheel, contract)
+
+    assert "Build is required" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
+
+
+def test_wheel_rejects_build_header_without_filename_tag(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract)
+    wheel_metadata = (
+        "Wheel-Version: 1.0\nGenerator: tests\nBuild: 1\n"
+        "Root-Is-Purelib: true\nTag: py3-none-any\n\n"
+    )
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert "Build must be omitted" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
+
+
+@pytest.mark.parametrize("build", ["", "invalid", "-1"])
+def test_wheel_rejects_invalid_build_header(tmp_path: Path, build: str) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract, filename_build="1")
+    wheel_metadata = (
+        f"Wheel-Version: 1.0\nGenerator: tests\nBuild: {build}\n"
+        "Root-Is-Purelib: true\nTag: py3-none-any\n\n"
+    )
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert "Build is invalid" in "\n".join(verify_wheel.validate_wheel(wheel, contract))
+
+
+def test_wheel_rejects_build_header_that_differs_from_filename(tmp_path: Path) -> None:
+    contract = _write_project(tmp_path)
+    wheel = _wheel_path(tmp_path, contract, filename_build="2alpha")
+    wheel_metadata = (
+        "Wheel-Version: 1.0\nGenerator: tests\nBuild: 1alpha\n"
+        "Root-Is-Purelib: true\nTag: py3-none-any\n\n"
+    )
+    _write_wheel(wheel, contract, wheel_metadata=wheel_metadata)
+
+    assert "Build does not match" in "\n".join(
+        verify_wheel.validate_wheel(wheel, contract)
+    )
 
 
 def _rewrite_record(wheel: Path, transform: Callable[[str], str]) -> None:

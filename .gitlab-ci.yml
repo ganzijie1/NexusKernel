@@ -5,11 +5,16 @@ stages:
   - artifact-test
   - container-smoke
 
+variables:
+  ADK_CAPTURE_MESSAGE_CONTENT_IN_SPANS: "false"
+  LITELLM_LOCAL_MODEL_COST_MAP: "true"
+  OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT: "NO_CONTENT"
+
 default:
-  image: python:3.11-slim
+  image: python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93
   before_script:
     - apt-get update && apt-get install -y --no-install-recommends bash git && rm -rf /var/lib/apt/lists/*
-    - python -m pip install --disable-pip-version-check ".[ai,dev]"
+    - python -m pip install --disable-pip-version-check --constraint constraints/py311-313.txt ".[ai,dev]"
 
 quality:
   stage: quality
@@ -18,17 +23,23 @@ quality:
     - ruff format --check .
     - ruff check .
     - ruff check --select C901 nexus_kernel app scripts
-    - mypy nexus_kernel app scripts/init_project.py scripts/check_python_version.py scripts/verify_wheel.py
+    - mypy nexus_kernel app scripts/init_project.py scripts/check_python_version.py scripts/check_text_contract.py scripts/delivery_contract.py scripts/security_scan.py scripts/verify_wheel.py
     - python -m pip check
     - python scripts/security_scan.py
-    - git diff --check
+    - python scripts/check_text_contract.py
+    - bash scripts/compile_constraints.sh --check
 
 test:
   stage: test
-  image: python:${PYTHON_VERSION}-slim
+  image: $PYTHON_IMAGE
   parallel:
     matrix:
-      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
+      - PYTHON_VERSION: ["3.11"]
+        PYTHON_IMAGE: ["python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"]
+      - PYTHON_VERSION: ["3.12"]
+        PYTHON_IMAGE: ["python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de"]
+      - PYTHON_VERSION: ["3.13"]
+        PYTHON_IMAGE: ["python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91"]
   script:
     - pytest -m "not real_llm" -q
     - python -m pip check
@@ -61,10 +72,15 @@ wheel:
 
 wheel-runtime-extras:
   stage: artifact-test
-  image: python:${PYTHON_VERSION}-slim
+  image: $PYTHON_IMAGE
   parallel:
     matrix:
-      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
+      - PYTHON_VERSION: ["3.11"]
+        PYTHON_IMAGE: ["python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"]
+      - PYTHON_VERSION: ["3.12"]
+        PYTHON_IMAGE: ["python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de"]
+      - PYTHON_VERSION: ["3.13"]
+        PYTHON_IMAGE: ["python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91"]
   needs:
     - job: wheel
       artifacts: true
@@ -72,16 +88,21 @@ wheel-runtime-extras:
   script:
     - WHEEL_PATH="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
     - test -n "$WHEEL_PATH"
-    - python -m pip install --disable-pip-version-check "${WHEEL_PATH}[ai,mongo,redis,qdrant,otel,postgres]"
-    - python -c "import asyncpg, google.adk, litellm, openai, pymongo, qdrant_client, redis, opentelemetry.sdk, opentelemetry.exporter.otlp.proto.grpc"
+    - python -m pip install --disable-pip-version-check --constraint constraints/py311-313.txt "${WHEEL_PATH}[ai,mongo,redis,qdrant,otel,postgres]"
+    - python -c "import asyncpg, google.adk, google.genai, litellm, openai, pymongo, qdrant_client, redis, starlette, opentelemetry.sdk, opentelemetry.exporter.otlp.proto.grpc"
     - python -m pip check
 
 wheel-core-only:
   stage: artifact-test
-  image: python:${PYTHON_VERSION}-slim
+  image: $PYTHON_IMAGE
   parallel:
     matrix:
-      - PYTHON_VERSION: ["3.11", "3.12", "3.13"]
+      - PYTHON_VERSION: ["3.11"]
+        PYTHON_IMAGE: ["python:3.11-slim@sha256:db3ff2e1800a8581e2c48a27c3995339d47bdf046da21c7627accd3d51053a93"]
+      - PYTHON_VERSION: ["3.12"]
+        PYTHON_IMAGE: ["python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de"]
+      - PYTHON_VERSION: ["3.13"]
+        PYTHON_IMAGE: ["python:3.13-slim@sha256:6771159cd4fa5d9bba1258caf0b82e6b73458c694d178ad97c5e925c2d0e1a91"]
   needs:
     - job: wheel
       artifacts: true
@@ -89,15 +110,16 @@ wheel-core-only:
   script:
     - WHEEL_PATH="$(find dist -maxdepth 1 -type f -name '*.whl' -print -quit)"
     - test -n "$WHEEL_PATH"
-    - python -m pip install --disable-pip-version-check "$WHEEL_PATH"
-    - python -c "import importlib.util; import app, nexus_kernel, nexus_kernel.ai, nexus_kernel.infrastructure; from nexus_kernel.ai import AgentToolSpec; AgentToolSpec(name='echo', description='echo', parameters={'type':'object'}, handler=lambda value:value); assert all(importlib.util.find_spec(name) is None for name in ('google','litellm','openai','pymongo','redis','asyncpg','qdrant_client'))"
+    - python -m pip install --disable-pip-version-check --constraint constraints/py311-313.txt "$WHEEL_PATH"
+    - python -c "import importlib.util; import app, nexus_kernel, nexus_kernel.ai, nexus_kernel.infrastructure, starlette; from nexus_kernel.ai import AgentToolSpec; AgentToolSpec(name='echo', description='echo', parameters={'type':'object'}, handler=lambda value, identity:value); assert all(importlib.util.find_spec(name) is None for name in ('google','httpx','httpx2','litellm','openai','pymongo','redis','asyncpg','qdrant_client'))"
     - python -m pip check
 
 container-smoke:
   stage: container-smoke
-  image: docker:27-cli
+  image: docker:27.5.1-cli@sha256:851f91d241214e7c6db86513b270d58776379aacc5eb9c4a87e5b47115e3065c
+  timeout: 15m
   services:
-    - name: docker:27-dind
+    - name: docker:27.5.1-dind@sha256:aa3df78ecf320f5fafdce71c659f1629e96e9de0968305fe1de670e0ca9176ce
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""
@@ -110,27 +132,65 @@ container-smoke:
     - docker compose --env-file docker/.env.prod.example -f docker/docker-compose-prod.yml config --quiet
     - docker build -f docker/Dockerfile -t nexus-kernel-starter:ci-default .
     - docker build --build-arg NEXUS_KERNEL_RUNTIME_EXTRAS=ai,mongo,redis,qdrant,otel,postgres -f docker/Dockerfile -t nexus-kernel-starter:ci .
-    - test "$(docker run --rm nexus-kernel-starter:ci id -u)" = "10001"
-    - docker run --rm --read-only --tmpfs /tmp nexus-kernel-starter:ci python -c "import app, nexus_kernel"
-    - docker run --rm -d --name nexus-kernel-api -e NEXUS_KERNEL_PORT="$NEXUS_KERNEL_DEFAULT_PORT" -p "$NEXUS_KERNEL_DEFAULT_PORT:$NEXUS_KERNEL_DEFAULT_PORT" nexus-kernel-starter:ci
+    - DEFAULT_IMAGE_SIZE_BYTES="$(docker image inspect --format '{{.Size}}' nexus-kernel-starter:ci-default)"
+    - FULL_IMAGE_SIZE_BYTES="$(docker image inspect --format '{{.Size}}' nexus-kernel-starter:ci)"
+    - test "$DEFAULT_IMAGE_SIZE_BYTES" -le 498073600
+    - test "$FULL_IMAGE_SIZE_BYTES" -le 671088640
+    - docker image inspect --format 'image=nexus-kernel-starter:ci-default digest={{.Id}} size_bytes={{.Size}}' nexus-kernel-starter:ci-default
+    - docker image inspect --format 'image=nexus-kernel-starter:ci digest={{.Id}} size_bytes={{.Size}}' nexus-kernel-starter:ci
+    - test "$(docker run --rm nexus-kernel-starter:ci-default id -u)" = "10001"
+    - test "$(docker run --rm nexus-kernel-starter:ci-default id -g)" = "10001"
+    - docker run --rm --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci-default python -m pip check
+    - docker run --rm --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci-default python -c "import importlib.util; import app, google.adk, google.genai, litellm, nexus_kernel, openai, starlette; assert all(importlib.util.find_spec(name) is None for name in ('asyncpg','httpx2','pymongo','qdrant_client','redis'))"
+    - docker run -d --name nexus-kernel-starter-default-api --read-only --tmpfs /tmp --security-opt no-new-privileges:true -e NEXUS_KERNEL_PORT="$NEXUS_KERNEL_DEFAULT_PORT" -p "$NEXUS_KERNEL_DEFAULT_PORT:$NEXUS_KERNEL_DEFAULT_PORT" nexus-kernel-starter:ci-default
     - |
       for attempt in $(seq 1 30); do
-        if wget -qO- "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live"; then
+        if wget -q -T 2 -t 1 -O /dev/null "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live"; then
           break
         fi
         if [ "$attempt" -eq 30 ]; then
-          docker logs nexus-kernel-api
+          docker logs nexus-kernel-starter-default-api
           exit 1
         fi
         sleep 1
       done
-    - wget -qO- "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/ready" | grep -Eq '"status"[[:space:]]*:[[:space:]]*"(healthy|degraded)"'
-    - docker rm -f nexus-kernel-api
-    - docker run --rm -d --name nexus-kernel-worker -e NEXUS_KERNEL_RUNTIME_ROLE=worker nexus-kernel-starter:ci
+    - wget -q -T 2 -t 1 -O - "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live" | docker run --rm -i --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci-default python -c "import json, sys; payload=json.load(sys.stdin); assert payload.get('success') is True; assert payload.get('data') == {'status':'alive'}"
+    - wget -q -T 2 -t 1 -O - "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/ready" | docker run --rm -i --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci-default python -c "import json, sys; payload=json.load(sys.stdin); data=payload.get('data'); assert payload.get('success') is True and isinstance(data, dict) and data.get('status') in {'healthy','degraded'}"
+    - docker stop --time 15 nexus-kernel-starter-default-api
+    - test "$(docker inspect -f '{{.State.ExitCode}}' nexus-kernel-starter-default-api)" = "0"
+    - docker run -d --name nexus-kernel-starter-default-worker --read-only --tmpfs /tmp --security-opt no-new-privileges:true -e NEXUS_KERNEL_RUNTIME_ROLE=worker nexus-kernel-starter:ci-default
     - sleep 2
-    - test "$(docker inspect -f '{{.State.Running}}' nexus-kernel-worker)" = "true"
-    - docker rm -f nexus-kernel-worker
+    - test "$(docker inspect -f '{{.State.Running}}' nexus-kernel-starter-default-worker)" = "true"
+    - docker stop --time 15 nexus-kernel-starter-default-worker
+    - test "$(docker inspect -f '{{.State.ExitCode}}' nexus-kernel-starter-default-worker)" = "0"
+    - test "$(docker run --rm nexus-kernel-starter:ci id -u)" = "10001"
+    - test "$(docker run --rm nexus-kernel-starter:ci id -g)" = "10001"
+    - docker run --rm --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci python -m pip check
+    - docker run --rm --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci python -c "import asyncpg, google.adk, google.genai, litellm, openai, opentelemetry.exporter.otlp.proto.grpc, opentelemetry.sdk, pymongo, qdrant_client, redis, starlette"
+    - docker run -d --name nexus-kernel-starter-full-api --read-only --tmpfs /tmp --security-opt no-new-privileges:true -e NEXUS_KERNEL_PORT="$NEXUS_KERNEL_DEFAULT_PORT" -p "$NEXUS_KERNEL_DEFAULT_PORT:$NEXUS_KERNEL_DEFAULT_PORT" nexus-kernel-starter:ci
+    - |
+      for attempt in $(seq 1 30); do
+        if wget -q -T 2 -t 1 -O /dev/null "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live"; then
+          break
+        fi
+        if [ "$attempt" -eq 30 ]; then
+          docker logs nexus-kernel-starter-full-api
+          exit 1
+        fi
+        sleep 1
+      done
+    - wget -q -T 2 -t 1 -O - "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live" | docker run --rm -i --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci python -c "import json, sys; payload=json.load(sys.stdin); assert payload.get('success') is True; assert payload.get('data') == {'status':'alive'}"
+    - wget -q -T 2 -t 1 -O - "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/ready" | docker run --rm -i --read-only --tmpfs /tmp --security-opt no-new-privileges:true nexus-kernel-starter:ci python -c "import json, sys; payload=json.load(sys.stdin); data=payload.get('data'); assert payload.get('success') is True and isinstance(data, dict) and data.get('status') in {'healthy','degraded'}"
+    - docker stop --time 15 nexus-kernel-starter-full-api
+    - test "$(docker inspect -f '{{.State.ExitCode}}' nexus-kernel-starter-full-api)" = "0"
+    - docker run -d --name nexus-kernel-starter-full-worker --read-only --tmpfs /tmp --security-opt no-new-privileges:true -e NEXUS_KERNEL_RUNTIME_ROLE=worker nexus-kernel-starter:ci
+    - sleep 2
+    - test "$(docker inspect -f '{{.State.Running}}' nexus-kernel-starter-full-worker)" = "true"
+    - docker stop --time 15 nexus-kernel-starter-full-worker
+    - test "$(docker inspect -f '{{.State.ExitCode}}' nexus-kernel-starter-full-worker)" = "0"
   after_script:
-    - docker logs nexus-kernel-api 2>/dev/null || true
-    - docker logs nexus-kernel-worker 2>/dev/null || true
-    - docker rm -f nexus-kernel-api nexus-kernel-worker 2>/dev/null || true
+    - docker logs nexus-kernel-starter-default-api 2>/dev/null || true
+    - docker logs nexus-kernel-starter-default-worker 2>/dev/null || true
+    - docker logs nexus-kernel-starter-full-api 2>/dev/null || true
+    - docker logs nexus-kernel-starter-full-worker 2>/dev/null || true
+    - docker rm -f nexus-kernel-starter-default-api nexus-kernel-starter-default-worker nexus-kernel-starter-full-api nexus-kernel-starter-full-worker 2>/dev/null || true

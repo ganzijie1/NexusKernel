@@ -7,6 +7,7 @@ import argparse
 import base64
 import csv
 import hashlib
+import re
 import sys
 import tomllib
 from collections import Counter
@@ -15,6 +16,7 @@ from email.message import Message
 from email.parser import BytesParser
 from email.policy import default
 from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING
 from zipfile import BadZipFile, ZipFile
 
 from packaging.requirements import InvalidRequirement, Requirement
@@ -26,14 +28,21 @@ from packaging.utils import (
     canonicalize_version,
     parse_wheel_filename,
 )
+from packaging.version import InvalidVersion
+
+if TYPE_CHECKING:
+    from scripts.delivery_contract import is_sensitive_artifact
+elif __package__:
+    from .delivery_contract import is_sensitive_artifact
+else:
+    from delivery_contract import is_sensitive_artifact
 
 
 ROOT = Path(__file__).resolve().parents[1]
 LEGACY_PACKAGE = "nexus" + "kernel"
 PACKAGE_ROOTS = frozenset({"nexus_kernel", "app"})
 DIST_INFO_FILES = frozenset({"METADATA", "WHEEL", "RECORD"})
-SENSITIVE_SUFFIXES = frozenset({".key", ".pem", ".p12", ".pfx"})
-SENSITIVE_NAMES = frozenset({"credentials.json", "service-account.json"})
+SUPPORTED_METADATA_VERSIONS = frozenset({"2.1", "2.2", "2.3", "2.4"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +107,7 @@ def load_project_contract(project_root: Path) -> WheelContract:
             for dependency in normalized_dependencies:
                 Requirement(dependency)
             optional_dependencies[extra] = normalized_dependencies
-    except (InvalidRequirement, InvalidSpecifier, ValueError) as exc:
+    except (InvalidRequirement, InvalidSpecifier, InvalidVersion, ValueError) as exc:
         raise ValueError("project wheel contract contains invalid metadata") from exc
     return WheelContract(
         distribution, version, requires_python, dependencies, optional_dependencies
@@ -111,61 +120,101 @@ def _unsafe_entry(entry: str) -> bool:
         return True
     if LEGACY_PACKAGE in path.parts or "__pycache__" in path.parts:
         return True
-    name = path.name.casefold()
     return (
-        name == ".env"
-        or name.startswith(".env.")
-        or name in SENSITIVE_NAMES
-        or path.suffix.casefold() in SENSITIVE_SUFFIXES
+        path.name.casefold() == ".env"
+        or path.name.casefold().startswith(".env.")
+        or is_sensitive_artifact(path)
     )
 
 
 def _parse_metadata(content: bytes, label: str, errors: list[str]) -> Message | None:
     try:
-        return BytesParser(policy=default).parsebytes(content)
+        metadata = BytesParser(policy=default).parsebytes(content)
     except (TypeError, ValueError) as exc:
         errors.append(f"invalid {label}: {type(exc).__name__}")
         return None
+    if metadata.defects:
+        errors.append(f"invalid {label} headers")
+        return None
+    return metadata
+
+
+def _required_single_header(
+    metadata: Message, label: str, field: str, errors: list[str]
+) -> str | None:
+    values = metadata.get_all(field, [])
+    if len(values) != 1 or not values[0].strip():
+        errors.append(f"{label} must contain exactly one {field}")
+        return None
+    return values[0].strip()
+
+
+def _optional_single_header(
+    metadata: Message, label: str, field: str, errors: list[str]
+) -> str | None:
+    values = metadata.get_all(field, [])
+    if len(values) > 1:
+        errors.append(f"{label} must contain at most one {field}")
+        return None
+    return values[0].strip() if values else None
 
 
 def _validate_filename(
     wheel: Path, contract: WheelContract, errors: list[str]
-) -> set[str]:
+) -> tuple[set[str], tuple[int, str] | None]:
     try:
-        distribution, version, _build, tags = parse_wheel_filename(wheel.name)
+        distribution, version, build, tags = parse_wheel_filename(wheel.name)
     except InvalidWheelFilename:
         errors.append("invalid wheel filename")
-        return set()
+        return set(), None
 
     if canonicalize_name(distribution) != canonicalize_name(contract.distribution):
         errors.append("wheel filename distribution does not match project")
     if canonicalize_version(str(version)) != canonicalize_version(contract.version):
         errors.append("wheel filename version does not match project")
-    return {str(tag) for tag in tags}
+    filename_build = (build[0], build[1]) if build else None
+    return {str(tag) for tag in tags}, filename_build
 
 
 def _validate_metadata(
     metadata: Message, contract: WheelContract, errors: list[str]
 ) -> None:
-    if canonicalize_name(metadata.get("Name", "")) != canonicalize_name(
+    metadata_version = _required_single_header(
+        metadata, "METADATA", "Metadata-Version", errors
+    )
+    name = _required_single_header(metadata, "METADATA", "Name", errors)
+    version = _required_single_header(metadata, "METADATA", "Version", errors)
+    requires_python = _required_single_header(
+        metadata, "METADATA", "Requires-Python", errors
+    )
+
+    if (
+        metadata_version is not None
+        and metadata_version not in SUPPORTED_METADATA_VERSIONS
+    ):
+        errors.append("METADATA uses an unsupported Metadata-Version")
+    if name is not None and canonicalize_name(name) != canonicalize_name(
         contract.distribution
     ):
         errors.append("METADATA Name does not match project")
-    if canonicalize_version(metadata.get("Version", "")) != canonicalize_version(
-        contract.version
-    ):
-        errors.append("METADATA Version does not match project")
-    requires_python = metadata.get("Requires-Python")
-    try:
-        matches = requires_python is not None and SpecifierSet(
-            requires_python
-        ) == SpecifierSet(contract.requires_python)
-    except InvalidSpecifier:
-        matches = False
-    if not matches:
-        errors.append(
-            f"METADATA Requires-Python does not match project: {requires_python!r}"
-        )
+    if version is not None:
+        try:
+            version_matches = canonicalize_version(version) == canonicalize_version(
+                contract.version
+            )
+        except InvalidVersion:
+            version_matches = False
+        if not version_matches:
+            errors.append("METADATA Version does not match project")
+    if requires_python is not None:
+        try:
+            matches = SpecifierSet(requires_python) == SpecifierSet(
+                contract.requires_python
+            )
+        except InvalidSpecifier:
+            matches = False
+        if not matches:
+            errors.append("METADATA Requires-Python does not match project")
 
     expected_extras = Counter(
         canonicalize_name(extra) for extra in contract.optional_dependencies
@@ -230,22 +279,53 @@ def _normalize_parsed_requirement(requirement: Requirement) -> tuple[object, ...
 
 
 def _validate_wheel_metadata(
-    wheel_metadata: Message, filename_tags: set[str], errors: list[str]
+    wheel_metadata: Message,
+    filename_tags: set[str],
+    filename_build: tuple[int, str] | None,
+    errors: list[str],
 ) -> None:
-    if wheel_metadata.get("Wheel-Version") != "1.0":
+    wheel_version = _required_single_header(
+        wheel_metadata, "WHEEL", "Wheel-Version", errors
+    )
+    purelib = _required_single_header(
+        wheel_metadata, "WHEEL", "Root-Is-Purelib", errors
+    )
+    _optional_single_header(wheel_metadata, "WHEEL", "Generator", errors)
+    build_values = wheel_metadata.get_all("Build", [])
+    build_value = _optional_single_header(wheel_metadata, "WHEEL", "Build", errors)
+    if wheel_version is not None and wheel_version != "1.0":
         errors.append("WHEEL must declare Wheel-Version 1.0")
-    if wheel_metadata.get("Root-Is-Purelib", "").casefold() != "true":
+    if purelib is not None and purelib.casefold() != "true":
         errors.append("WHEEL must declare Root-Is-Purelib true")
     try:
-        wheel_tags = {
+        parsed_tags = [
             str(tag)
             for value in wheel_metadata.get_all("Tag", [])
             for tag in parse_tag(value)
-        }
+        ]
     except ValueError:
-        wheel_tags = set()
+        parsed_tags = []
+    if any(count > 1 for count in Counter(parsed_tags).values()):
+        errors.append("WHEEL contains duplicate Tag values")
+    wheel_tags = set(parsed_tags)
     if not wheel_tags or wheel_tags != filename_tags:
         errors.append("WHEEL tags do not match wheel filename")
+    if len(build_values) > 1:
+        return
+    if filename_build is None:
+        if build_values:
+            errors.append("WHEEL Build must be omitted without a filename build tag")
+        return
+    if not build_values:
+        errors.append("WHEEL Build is required for the filename build tag")
+        return
+    match = re.fullmatch(r"(?P<number>\d+)(?P<suffix>.*)", build_value or "")
+    if match is None:
+        errors.append("WHEEL Build is invalid")
+        return
+    wheel_build = (int(match.group("number")), match.group("suffix"))
+    if wheel_build != filename_build:
+        errors.append("WHEEL Build does not match wheel filename")
 
 
 def _validate_record(
@@ -292,7 +372,7 @@ def _validate_record(
 
 def validate_wheel(wheel: Path, contract: WheelContract) -> list[str]:
     errors: list[str] = []
-    filename_tags = _validate_filename(wheel, contract, errors)
+    filename_tags, filename_build = _validate_filename(wheel, contract, errors)
     try:
         with ZipFile(wheel) as archive:
             names = archive.namelist()
@@ -350,7 +430,9 @@ def validate_wheel(wheel: Path, contract: WheelContract) -> list[str]:
             if metadata is not None:
                 _validate_metadata(metadata, contract, errors)
             if wheel_metadata is not None:
-                _validate_wheel_metadata(wheel_metadata, filename_tags, errors)
+                _validate_wheel_metadata(
+                    wheel_metadata, filename_tags, filename_build, errors
+                )
             _validate_record(
                 archive.read(required["RECORD"]),
                 archive,

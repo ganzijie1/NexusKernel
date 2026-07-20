@@ -61,12 +61,17 @@ version_checker="$script_dir/check_python_version.py"
 
 [[ -f "$version_checker" ]] || fail "missing Python version checker: $version_checker"
 
+constraints_arguments=()
 case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*)
         environment_name=".venv-win"
         ;;
     Linux*)
         environment_name=".venv-linux"
+        constraints_file="$project_root/constraints/py311-313.txt"
+        [[ -f "$constraints_file" ]] \
+            || fail "missing Python constraints: $constraints_file"
+        constraints_arguments=(--constraint "$constraints_file")
         ;;
     Darwin*)
         environment_name=".venv-macos"
@@ -114,6 +119,7 @@ safe_remove_environment() {
     local target="$1"
     local target_parent
     local canonical_target
+    local attempt
 
     target_parent="$(cd -- "$(dirname -- "$target")" && pwd -P)"
     canonical_target="$target_parent/$(basename -- "$target")"
@@ -126,7 +132,12 @@ safe_remove_environment() {
             ;;
     esac
 
-    rm -rf -- "$canonical_target"
+    for ((attempt = 1; attempt <= 50; attempt++)); do
+        rm -rf -- "$canonical_target" 2>/dev/null || true
+        sleep 0.2
+        [[ ! -e "$canonical_target" ]] && return 0
+    done
+    fail "could not remove existing environment: $canonical_target"
 }
 
 create_environment=true
@@ -166,6 +177,8 @@ if [[ "$create_environment" == true ]]; then
 fi
 
 cd -- "$project_root"
-"$environment_python" -m pip install --upgrade pip
-"$environment_python" -m pip install --editable ".[ai,dev]"
+"$environment_python" -m pip --version >/dev/null
+"$environment_python" -m pip install \
+    "${constraints_arguments[@]}" \
+    --editable ".[ai,dev]"
 "$environment_python" -c 'import sys; print(sys.executable)'

@@ -6,10 +6,31 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import NoReturn, Sequence
+from typing import TYPE_CHECKING, NoReturn, Sequence
+
+_previous_dont_write_bytecode = sys.dont_write_bytecode
+_script_path_entry: str | None = None
+try:
+    sys.dont_write_bytecode = True
+    if TYPE_CHECKING:
+        from scripts.delivery_contract import (
+            ENV_EXAMPLE_NAMES,
+            ENV_EXAMPLE_TO_GENERATED,
+        )
+    elif __package__:
+        from .delivery_contract import ENV_EXAMPLE_NAMES, ENV_EXAMPLE_TO_GENERATED
+    else:
+        _script_path_entry = str(Path(__file__).resolve().parent)
+        sys.path.insert(0, _script_path_entry)
+        from delivery_contract import ENV_EXAMPLE_NAMES, ENV_EXAMPLE_TO_GENERATED
+finally:
+    sys.dont_write_bytecode = _previous_dont_write_bytecode
+    if _script_path_entry is not None:
+        sys.path.remove(_script_path_entry)
 
 
 DEFAULT_NAME = "NexusKernel Starter"
@@ -48,8 +69,6 @@ _DEFAULT_SLUG_RE = re.compile(rf"(?<![a-z0-9-]){re.escape(DEFAULT_SLUG)}(?![a-z0
 _DEFAULT_ENV_PREFIX_RE = re.compile(
     rf"(?<![A-Z0-9_]){re.escape(DEFAULT_ENV_PREFIX)}(?=_|[^A-Z0-9_]|$)"
 )
-_ENV_EXAMPLE_RE = re.compile(r"^\.env(?:\.[A-Za-z0-9_-]+)?\.example$")
-
 _DISPLAY_NAME_PLACEHOLDER = "display name"
 _SLUG_PLACEHOLDER = "slug"
 _ENV_PREFIX_PLACEHOLDER = "env prefix"
@@ -136,14 +155,23 @@ def _path_exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
+def _is_reparse_point(metadata: os.stat_result) -> bool:
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+
+
 def _require_safe_file(root: Path, path: Path, *, required: bool = False) -> bool:
     if not _path_exists(path):
         if required:
             _fail(f"required file is missing: {_relative_display(root, path)}")
         return False
-    if path.is_symlink():
+    try:
+        metadata = path.lstat()
+    except OSError:
+        _fail(f"cannot inspect file: {_relative_display(root, path)}")
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
         _fail(f"refusing symlinked file: {_relative_display(root, path)}")
-    if not path.is_file():
+    if not stat.S_ISREG(metadata.st_mode):
         if required:
             _fail(f"required path is not a file: {_relative_display(root, path)}")
         return False
@@ -158,24 +186,101 @@ def _matching_files(root: Path, directory: str, suffixes: set[str]) -> list[Path
     base = root / directory
     if not _path_exists(base):
         return []
-    if base.is_symlink():
+    try:
+        base_metadata = base.lstat()
+    except OSError:
+        _fail(f"cannot inspect directory: {directory}")
+    if stat.S_ISLNK(base_metadata.st_mode) or _is_reparse_point(base_metadata):
         _fail(f"refusing symlinked directory: {directory}")
-    if not base.is_dir():
+    if not stat.S_ISDIR(base_metadata.st_mode):
         return []
 
     matches: list[Path] = []
-    for path in base.rglob("*"):
-        if path.suffix not in suffixes:
-            continue
-        if path.is_symlink():
-            _fail(f"refusing symlinked file: {_relative_display(root, path)}")
-        if path.is_file():
+    for current, dirnames, filenames in os.walk(base, topdown=True, followlinks=False):
+        current_path = Path(current)
+        for name in sorted(dirnames):
+            path = current_path / name
+            try:
+                metadata = path.lstat()
+            except OSError:
+                _fail(f"cannot inspect directory: {_relative_display(root, path)}")
+            if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+                _fail(f"refusing symlinked directory: {_relative_display(root, path)}")
+            if not stat.S_ISDIR(metadata.st_mode):
+                _fail(
+                    f"required path is not a directory: {_relative_display(root, path)}"
+                )
+        dirnames[:] = sorted(dirnames)
+        for name in sorted(filenames):
+            path = current_path / name
+            if path.suffix not in suffixes:
+                continue
+            _require_safe_file(root, path, required=True)
             matches.append(path)
     return matches
 
 
+def _environment_examples(root: Path) -> dict[str, Path]:
+    docker = root / "docker"
+    if not _path_exists(docker):
+        _fail("required directory is missing: docker")
+    try:
+        metadata = docker.lstat()
+    except OSError:
+        _fail("cannot inspect directory: docker")
+    if stat.S_ISLNK(metadata.st_mode) or _is_reparse_point(metadata):
+        _fail("refusing symlinked directory: docker")
+    if not stat.S_ISDIR(metadata.st_mode):
+        _fail("required path is not a directory: docker")
+    discovered = {
+        path.name: path
+        for path in docker.iterdir()
+        if path.name.startswith(".env") and path.name.endswith(".example")
+    }
+    unexpected = sorted(discovered.keys() - ENV_EXAMPLE_NAMES)
+    if unexpected:
+        _fail("unsupported environment example(s): " + ", ".join(unexpected))
+    missing = sorted(ENV_EXAMPLE_NAMES - discovered.keys())
+    if missing:
+        _fail("missing environment example(s): " + ", ".join(missing))
+    for name in sorted(ENV_EXAMPLE_NAMES):
+        _require_safe_file(root, discovered[name], required=True)
+    return discovered
+
+
+def _skill_instruction_files(root: Path) -> list[Path]:
+    codex_root = root / ".codex"
+    if not _path_exists(codex_root):
+        return []
+    if codex_root.is_symlink():
+        _fail("refusing symlinked directory: .codex")
+    if not codex_root.is_dir():
+        _fail("required path is not a directory: .codex")
+    skills_root = codex_root / "skills"
+    if not _path_exists(skills_root):
+        return []
+    if skills_root.is_symlink():
+        _fail("refusing symlinked directory: .codex/skills")
+    if not skills_root.is_dir():
+        _fail("required path is not a directory: .codex/skills")
+
+    instructions: list[Path] = []
+    for directory, dirnames, filenames in os.walk(
+        skills_root, topdown=True, followlinks=False
+    ):
+        base = Path(directory)
+        for name in sorted(dirnames):
+            path = base / name
+            if path.is_symlink():
+                _fail(f"refusing symlinked directory: {_relative_display(root, path)}")
+        dirnames[:] = sorted(dirnames)
+        if "SKILL.md" in filenames:
+            instructions.append(base / "SKILL.md")
+    return instructions
+
+
 def _discover_whitelist(root: Path) -> list[Path]:
-    required = [root / "README.md", root / "pyproject.toml"]
+    required = [root / "README.md", root / "pyproject.toml", root / "AGENTS.md"]
     for path in required:
         _require_safe_file(root, path, required=True)
 
@@ -183,24 +288,18 @@ def _discover_whitelist(root: Path) -> list[Path]:
     candidates.extend(_matching_files(root, "config", {".yaml", ".yml"}))
 
     docker = root / "docker"
-    if _path_exists(docker):
-        if docker.is_symlink():
-            _fail("refusing symlinked directory: docker")
-        if docker.is_dir():
-            candidates.extend(
-                [
-                    docker / "Dockerfile",
-                    docker / "README.md",
-                    *docker.glob("docker-compose-*.yml"),
-                    *(
-                        path
-                        for path in docker.glob("*.example")
-                        if _ENV_EXAMPLE_RE.fullmatch(path.name)
-                    ),
-                ]
-            )
+    discovered_examples = _environment_examples(root)
+    candidates.extend(
+        [
+            docker / "Dockerfile",
+            docker / "README.md",
+            *docker.glob("docker-compose-*.yml"),
+            *(discovered_examples[name] for name in sorted(ENV_EXAMPLE_NAMES)),
+        ]
+    )
 
     candidates.append(root / ".gitlab-ci.yml")
+    candidates.extend(_skill_instruction_files(root))
     superpowers_docs = root / "docs/superpowers"
     candidates.extend(
         path
@@ -229,6 +328,11 @@ def _replacement_pattern(relative_path: str) -> re.Pattern[str]:
             r"(?P<yaml_key_close_quote>[\"']?)(?![0-9]))"
         ),
     ]
+    if relative_path == ".gitlab-ci.yml":
+        alternatives.append(
+            rf"(?P<ci_container_slug>(?<![a-z0-9-]){re.escape(DEFAULT_SLUG)}"
+            r"(?=-(?:default|full)-(?:api|worker)(?![a-z0-9-])))"
+        )
     if relative_path.endswith((".yaml", ".yml")):
         alternatives.append(
             rf"(?P<compose_port>\$\{{{DEFAULT_ENV_PREFIX}_PORT:-{DEFAULT_PORT}\}})"
@@ -302,6 +406,11 @@ def _transform_text(
                 f"{port}{match.group('yaml_port_close_quote')}"
                 f"{match.group('yaml_port_suffix')}"
             )
+        if "ci_container_slug" in match.re.groupindex and match.group(
+            "ci_container_slug"
+        ):
+            hits.add(_SLUG_PLACEHOLDER)
+            return identity.slug
         if match.group("display_name") is not None:
             hits.add(_DISPLAY_NAME_PLACEHOLDER)
             return identity.name
@@ -331,9 +440,10 @@ def _decode_candidate(
 
 
 def _real_env_path(example: Path) -> Path | None:
-    if not _ENV_EXAMPLE_RE.fullmatch(example.name):
+    generated_name = ENV_EXAMPLE_TO_GENERATED.get(example.name)
+    if generated_name is None:
         return None
-    return example.with_name(example.name.removesuffix(".example"))
+    return example.with_name(generated_name)
 
 
 def _plan_writes(root: Path, identity: ProjectIdentity) -> list[_PlannedWrite]:
@@ -538,13 +648,15 @@ def _acquire_lock(root: Path) -> Path:
 def initialize_project(root: Path, identity: ProjectIdentity) -> None:
     """Initialize a template copy in place with atomic rollback on failure."""
     root = root.resolve(strict=True)
+    validated = _validate_identity(identity)
+    _environment_examples(root)
     lock = _acquire_lock(root)
     try:
         marker = root / MARKER_NAME
         if _path_exists(marker):
             _fail(f"project is already initialized: {MARKER_NAME}")
 
-        validated = _validate_identity(identity)
+        _environment_examples(root)
         writes = _plan_writes(root, validated)
         _commit_writes(writes)
     finally:

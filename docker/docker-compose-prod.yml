@@ -11,13 +11,14 @@ services:
     ports:
       - "${NEXUS_KERNEL_PORT:-8030}:${NEXUS_KERNEL_PORT:-8030}"
     restart: unless-stopped
+    user: "10001:10001"
     read_only: true
     tmpfs: [/tmp]
     security_opt: ["no-new-privileges:true"]
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NEXUS_KERNEL_PORT:-8030}/health/live')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:${NEXUS_KERNEL_PORT:-8030}/health/live', timeout=2)"]
       interval: 15s
-      timeout: 3s
+      timeout: 2s
       retries: 5
 
   worker:
@@ -29,6 +30,7 @@ services:
       NEXUS_KERNEL_RUNTIME_ROLE: worker
     profiles: ["worker"]
     restart: unless-stopped
+    user: "10001:10001"
     read_only: true
     tmpfs: [/tmp]
     security_opt: ["no-new-privileges:true"]

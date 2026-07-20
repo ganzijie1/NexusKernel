@@ -17,6 +17,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON_INITIALIZER = ROOT / "scripts/init_project.py"
 BASH_INITIALIZER = ROOT / "scripts/init_project.sh"
+DELIVERY_CONTRACT = ROOT / "scripts/delivery_contract.py"
 VALID_ARGUMENTS = (
     "--name",
     "Acme Intelligence",
@@ -51,6 +52,10 @@ def _write(path: Path, content: str) -> None:
 
 def _make_template(tmp_path: Path) -> Path:
     project = tmp_path / "template"
+    _write(
+        project / "AGENTS.md",
+        "NexusKernel Starter uses nexus-kernel-starter. NEXUS_KERNEL_DEFAULT_PORT=8030\n",
+    )
     _write(
         project / "README.md",
         """# NexusKernel Starter
@@ -99,22 +104,14 @@ include = ["nexus_kernel*"]
       sample-port: "8030"
 """,
     )
-    _write(
-        project / "docker/.env.example",
-        """NEXUS_KERNEL_DEFAULT_PORT=8030
-NEXUS_KERNEL_PORT=8030
-NEXUS_KERNEL_API_KEY=
-""",
-    )
-    _write(
-        project / "docker/.env.dev.example",
-        """NEXUS_KERNEL_DEFAULT_PORT=8030
+    env_example = """NEXUS_KERNEL_DEFAULT_PORT=8030
 NEXUS_KERNEL_PORT=8030
 NEXUS_KERNEL_API_KEY=
 DATABASE_URL=${DATABASE_URL:-}
 HOST=localhost
-""",
-    )
+"""
+    for profile in ("dev", "preprod", "prod"):
+        _write(project / f"docker/.env.{profile}.example", env_example)
     _write(
         project / "docker/other.example",
         "NexusKernel Starter nexus-kernel-starter NEXUS_KERNEL 8030\n",
@@ -132,11 +129,23 @@ container-smoke:
   script:
     - docker run -e NEXUS_KERNEL_PORT="$NEXUS_KERNEL_DEFAULT_PORT" -p "$NEXUS_KERNEL_DEFAULT_PORT:$NEXUS_KERNEL_DEFAULT_PORT" image
     - curl "http://docker:$NEXUS_KERNEL_DEFAULT_PORT/health/live"
+    - docker run --name nexus-kernel-starter-default-api image
+    - docker run --name nexus-kernel-starter-default-worker image
+    - docker run --name nexus-kernel-starter-full-api image
+    - docker run --name nexus-kernel-starter-full-worker image
 """,
     )
     _write(
         project / "docs/guide/nested.md",
         "NexusKernel Starter uses nexus-kernel-starter and NEXUS_KERNEL.\n",
+    )
+    _write(
+        project / ".codex/skills/group/sample/SKILL.md",
+        "NexusKernel Starter uses nexus-kernel-starter. NEXUS_KERNEL_DEFAULT_PORT=8030\n",
+    )
+    _write(
+        project / ".codex/skills/group/sample/agents/openai.yaml",
+        "default_prompt: NexusKernel Starter NEXUS_KERNEL 8030\n",
     )
     _write(
         project / "docs/superpowers/plans/review.md",
@@ -165,12 +174,16 @@ container-smoke:
 
 
 def _copy_initializer(project: Path) -> None:
-    if not PYTHON_INITIALIZER.is_file() or not BASH_INITIALIZER.is_file():
+    if not all(
+        path.is_file()
+        for path in (PYTHON_INITIALIZER, BASH_INITIALIZER, DELIVERY_CONTRACT)
+    ):
         pytest.skip("initializer entry points are absent during the expected RED run")
     scripts = project / "scripts"
     scripts.mkdir(parents=True, exist_ok=True)
     shutil.copy2(PYTHON_INITIALIZER, scripts / PYTHON_INITIALIZER.name)
     shutil.copy2(BASH_INITIALIZER, scripts / BASH_INITIALIZER.name)
+    shutil.copy2(DELIVERY_CONTRACT, scripts / DELIVERY_CONTRACT.name)
 
 
 @pytest.fixture
@@ -206,15 +219,18 @@ def _snapshot(project: Path) -> dict[str, tuple[bytes, int]]:
 def _replace_in_template_files(project: Path, old: str, new: str) -> None:
     relative_paths = (
         "README.md",
+        "AGENTS.md",
         "pyproject.toml",
         "config/settings.yaml",
         "docker/Dockerfile",
         "docker/docker-compose-dev.yml",
-        "docker/.env.example",
         "docker/.env.dev.example",
+        "docker/.env.preprod.example",
+        "docker/.env.prod.example",
         "docker/README.md",
         ".gitlab-ci.yml",
         "docs/guide/nested.md",
+        ".codex/skills/group/sample/SKILL.md",
     )
     for relative_path in relative_paths:
         path = project / relative_path
@@ -237,7 +253,9 @@ def _load_initializer(project: Path) -> ModuleType:
 def test_initializer_entry_points_exist() -> None:
     assert PYTHON_INITIALIZER.is_file(), "missing scripts/init_project.py"
     assert BASH_INITIALIZER.is_file(), "missing scripts/init_project.sh"
+    assert DELIVERY_CONTRACT.is_file(), "missing scripts/delivery_contract.py"
     assert (ROOT / "scripts/check_python_version.py").is_file()
+    assert (ROOT / "scripts/check_text_contract.py").is_file()
 
 
 def test_bash_entry_point_is_strict_and_only_delegates_to_python() -> None:
@@ -295,9 +313,18 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     config = (template / "config/settings.yaml").read_text(encoding="utf-8")
     compose = (template / "docker/docker-compose-dev.yml").read_text(encoding="utf-8")
     dockerfile = (template / "docker/Dockerfile").read_text(encoding="utf-8")
-    generated_base_env = (template / "docker/.env").read_text(encoding="utf-8")
-    generated_env = (template / "docker/.env.dev").read_text(encoding="utf-8")
+    generated_envs = {
+        profile: (template / f"docker/.env.{profile}").read_text(encoding="utf-8")
+        for profile in ("dev", "preprod", "prod")
+    }
     nested_doc = (template / "docs/guide/nested.md").read_text(encoding="utf-8")
+    agents = (template / "AGENTS.md").read_text(encoding="utf-8")
+    skill = (template / ".codex/skills/group/sample/SKILL.md").read_text(
+        encoding="utf-8"
+    )
+    skill_metadata = (
+        template / ".codex/skills/group/sample/agents/openai.yaml"
+    ).read_text(encoding="utf-8")
     pipeline = (template / ".gitlab-ci.yml").read_text(encoding="utf-8")
     marker = json.loads(
         (template / ".nexus-kernel-initialized").read_text(encoding="utf-8")
@@ -320,15 +347,31 @@ def test_valid_initialization_replaces_identity_and_generates_env(
     assert "${OTHER_PORT:-8030}:8030" in compose
     assert 'sample-port: "8030"' in compose
     assert "EXPOSE 9123" in dockerfile
-    assert "ACME_AI_DEFAULT_PORT=9123" in generated_base_env
-    assert "ACME_AI_PORT=9123" in generated_base_env
-    assert "ACME_AI_API_KEY=" in generated_base_env
-    assert "ACME_AI_DEFAULT_PORT=9123" in generated_env
-    assert "ACME_AI_PORT=9123" in generated_env
-    assert "ACME_AI_API_KEY=" in generated_env
+    for generated_env in generated_envs.values():
+        assert "ACME_AI_DEFAULT_PORT=9123" in generated_env
+        assert "ACME_AI_PORT=9123" in generated_env
+        assert "ACME_AI_API_KEY=" in generated_env
     assert "Acme Intelligence" in nested_doc
+    for transformed_guidance in (agents, skill):
+        assert "Acme Intelligence" in transformed_guidance
+        assert "acme-intelligence" in transformed_guidance
+        assert "ACME_AI" in transformed_guidance
+        assert "9123" in transformed_guidance
+        assert "NexusKernel Starter" not in transformed_guidance
+        assert "nexus-kernel-starter" not in transformed_guidance
+        assert "NEXUS_KERNEL" not in transformed_guidance
+        assert "8030" not in transformed_guidance
+    assert skill_metadata == "default_prompt: NexusKernel Starter NEXUS_KERNEL 8030\n"
     assert 'ACME_AI_DEFAULT_PORT: "9123"' in pipeline
     assert "$ACME_AI_DEFAULT_PORT" in pipeline
+    for role in (
+        "default-api",
+        "default-worker",
+        "full-api",
+        "full-worker",
+    ):
+        assert f"acme-intelligence-{role}" in pipeline
+    assert "nexus-kernel-starter" not in pipeline
     assert "NEXUS_KERNEL" not in pipeline
     assert "8030" not in pipeline
     assert "nexus_kernel" in readme
@@ -339,6 +382,174 @@ def test_valid_initialization_replaces_identity_and_generates_env(
         "env_prefix": "ACME_AI",
         "port": 9123,
     }
+
+
+@pytest.mark.parametrize("profile", ["dev", "preprod", "prod"])
+def test_missing_required_environment_example_is_rejected_before_writes(
+    template: Path, profile: str
+) -> None:
+    (template / f"docker/.env.{profile}.example").unlink()
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert f".env.{profile}.example" in result.stderr
+    assert _snapshot(template) == before
+    assert not (template / ".nexus-kernel-initialized").exists()
+
+
+def test_missing_docker_directory_is_rejected_before_writes(template: Path) -> None:
+    shutil.rmtree(template / "docker")
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert "docker" in result.stderr
+    assert _snapshot(template) == before
+    assert not (template / ".nexus-kernel-initialized").exists()
+
+
+@pytest.mark.parametrize("kind", ["directory", "fifo", "symlink"])
+def test_required_environment_example_must_be_a_regular_file(
+    template: Path, kind: str
+) -> None:
+    example = template / "docker/.env.dev.example"
+    example.unlink()
+    if kind == "directory":
+        example.mkdir()
+    elif kind == "fifo":
+        if not hasattr(os, "mkfifo"):
+            pytest.skip("FIFO is unavailable")
+        os.mkfifo(example)
+    else:
+        target = template / "docker/env-example-target"
+        _write(target, "NEXUS_KERNEL_API_KEY=\n")
+        try:
+            example.symlink_to(target)
+        except OSError:
+            pytest.skip("symbolic links are unavailable")
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert ".env.dev.example" in result.stderr
+    assert _snapshot(template) == before
+    assert not (template / ".nexus-kernel-initialized").exists()
+
+
+def test_required_environment_example_must_be_utf8(template: Path) -> None:
+    example = template / "docker/.env.dev.example"
+    example.write_bytes(b"not-utf8-\xff")
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert "environment example must be UTF-8 text" in result.stderr
+    assert _snapshot(template) == before
+    assert not (template / ".nexus-kernel-initialized").exists()
+
+
+@pytest.mark.parametrize("name", [".env.example", ".env.local.example"])
+def test_unsupported_environment_example_is_rejected_before_writes(
+    template: Path, name: str
+) -> None:
+    _write(template / "docker" / name, "NEXUS_KERNEL_API_KEY=\n")
+    before = _snapshot(template)
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert name in result.stderr
+    assert _snapshot(template) == before
+    assert not (template / ".nexus-kernel-initialized").exists()
+
+
+@pytest.mark.parametrize("profile_error", ["missing", "unknown"])
+def test_environment_profile_preflight_runs_before_lock_creation(
+    template: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile_error: str,
+) -> None:
+    module = _load_initializer(template)
+    if profile_error == "missing":
+        (template / "docker/.env.dev.example").unlink()
+    else:
+        _write(template / "docker/.env.staging.example", "API_KEY=\n")
+    lock_attempted = False
+
+    def fail_if_locked(root: Path) -> Path:
+        nonlocal lock_attempted
+        lock_attempted = True
+        raise AssertionError(f"profile preflight wrote lock under {root}")
+
+    monkeypatch.setattr(module, "_acquire_lock", fail_if_locked)
+    identity = module.ProjectIdentity(
+        name="Acme Intelligence",
+        slug="acme-intelligence",
+        env_prefix="ACME_AI",
+        port=9123,
+    )
+
+    with pytest.raises(module.InitializationError):
+        module.initialize_project(template, identity)
+
+    assert not lock_attempted
+    assert not (template / ".nexus-kernel-init.lock").exists()
+
+
+def test_environment_profiles_are_rechecked_while_lock_is_held(
+    template: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_initializer(template)
+    real_environment_examples = module._environment_examples
+    calls = 0
+
+    def changing_environment_examples(root: Path) -> object:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise module.InitializationError("environment profiles changed")
+        return real_environment_examples(root)
+
+    monkeypatch.setattr(module, "_environment_examples", changing_environment_examples)
+    identity = module.ProjectIdentity(
+        name="Acme Intelligence",
+        slug="acme-intelligence",
+        env_prefix="ACME_AI",
+        port=9123,
+    )
+
+    with pytest.raises(module.InitializationError, match="profiles changed"):
+        module.initialize_project(template, identity)
+
+    assert calls == 2
+    assert not (template / ".nexus-kernel-init.lock").exists()
+    assert not (template / ".nexus-kernel-initialized").exists()
+
+
+@pytest.mark.parametrize("directory", ["config", "docs"])
+def test_nested_whitelist_symlink_directory_is_rejected(
+    template: Path, tmp_path: Path, directory: str
+) -> None:
+    outside = tmp_path / f"outside-{directory}"
+    outside.mkdir()
+    suffix = ".yaml" if directory == "config" else ".md"
+    _write(outside / f"hidden{suffix}", "NexusKernel Starter NEXUS_KERNEL 8030\n")
+    linked = template / directory / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("symbolic links are unavailable")
+
+    result = _run_initializer(template)
+
+    assert result.returncode != 0
+    assert "symlinked directory" in result.stderr
+    assert not (template / ".nexus-kernel-initialized").exists()
 
 
 @pytest.mark.parametrize(
@@ -589,7 +800,7 @@ def test_abbreviated_options_are_rejected_without_writes(
     assert _snapshot(template) == before
 
 
-@pytest.mark.parametrize("missing", ["README.md", "pyproject.toml"])
+@pytest.mark.parametrize("missing", ["README.md", "pyproject.toml", "AGENTS.md"])
 def test_missing_required_root_file_is_rejected_without_writes(
     template: Path, missing: str
 ) -> None:
@@ -685,7 +896,10 @@ def test_lock_contains_pid_uses_private_mode_and_is_removed(
     assert not (template / ".nexus-kernel-init.lock").exists()
 
 
-@pytest.mark.parametrize("real_env", ["docker/.env", "docker/.env.dev"])
+@pytest.mark.parametrize(
+    "real_env",
+    ["docker/.env.dev", "docker/.env.preprod", "docker/.env.prod"],
+)
 def test_existing_real_env_is_rejected_without_any_write(
     template: Path, real_env: str
 ) -> None:
@@ -703,7 +917,7 @@ def test_existing_real_env_is_rejected_without_any_write(
 @pytest.mark.parametrize(
     ("race_target", "external_content"),
     [
-        ("docker/.env", "EXTERNAL_ENV=value\n"),
+        ("docker/.env.dev", "EXTERNAL_ENV=value\n"),
         (".nexus-kernel-initialized", "external marker\n"),
     ],
 )
@@ -805,8 +1019,8 @@ def test_replace_failure_restores_files_env_and_marker(
         module.initialize_project(template, identity)
 
     assert _snapshot(template) == before
-    assert not (template / "docker/.env").exists()
-    assert not (template / "docker/.env.dev").exists()
+    for profile in ("dev", "preprod", "prod"):
+        assert not (template / f"docker/.env.{profile}").exists()
     assert not (template / ".nexus-kernel-initialized").exists()
     assert not list(template.rglob("*.tmp"))
     assert not (template / ".nexus-kernel-init.lock").exists()
@@ -846,8 +1060,8 @@ def test_generated_env_and_marker_are_planned_with_private_modes(
         write.target.relative_to(template).as_posix(): write.mode for write in writes
     }
 
-    assert modes["docker/.env"] == 0o600
-    assert modes["docker/.env.dev"] == 0o600
+    for profile in ("dev", "preprod", "prod"):
+        assert modes[f"docker/.env.{profile}"] == 0o600
     assert modes[".nexus-kernel-initialized"] == 0o600
 
 
@@ -861,6 +1075,7 @@ def test_non_whitelisted_files_are_never_modified(template: Path) -> None:
             template / "docker/other.example",
             template / "docs/superpowers/plans/review.md",
             template / "docs/superpowers/specs/review.md",
+            template / ".codex/skills/group/sample/agents/openai.yaml",
         )
     }
 
