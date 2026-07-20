@@ -8,6 +8,25 @@
 未知字段，未解析
 `${VAR}`、无效类型和无效模块类都会阻止启动。
 
+每个模块定义可省略 `dependencies` 与 `optional_dependencies`，默认均为空列表。非空时
+必须与 Module 类的同名属性按集合严格一致；空白、重复、重叠、自依赖、缺失或禁用的必需
+依赖都会在任何业务实现导入前失败。缺失或禁用的可选依赖不建拓扑边，消费者仍会加载并
+按生命周期合同降级。模块映射和依赖列表的书写顺序都不影响导入、注册或启动结果；同级
+模块按名称稳定排序。
+
+```yaml
+modules:
+  consumer:
+    class: app.modules.consumer.module.ConsumerModule
+    dependencies: [base]
+    optional_dependencies: [telemetry]
+  base:
+    class: app.modules.base.module.BaseModule
+```
+
+上例故意先书写消费者；实际 import、构造、注册和启动仍然先执行 `base`。若启用了
+`telemetry`，它也会先于 `consumer`；未配置或禁用时不会导入其实现。
+
 server 的响应规范化缓冲由 `NEXUS_KERNEL_MAX_RESPONSE_BUFFER_BYTES` 控制，默认
 10485760 字节；超限请求返回稳定的 `response_too_large`。Module 清理预算由
 `NEXUS_KERNEL_MODULE_CLEANUP_TIMEOUT_SECONDS` 控制，默认 5 秒；未协作结束的 Module
@@ -92,9 +111,10 @@ ADK 2.4 的内容捕获采用两层关闭：每次调用的 `TelemetryConfig` �
 构建前清理 `build/dist`，完成后执行内容校验。`ai` 固定 ADK 2.4 与直接使用的
 Google Gen AI 2.12，Core 固定直接使用的 Starlette 1.3。
 
-当前精确版本约束只固定项目的直接依赖，传递依赖仍由安装器解析，不等价于完整锁文件。
-若以后要求可重复供应链，应从 `pyproject.toml` 生成按 Python/平台区分的 constraints 或
-标准 lock；生成物不得成为第二个人工编辑入口。
+项目固定 uv 版本，并从 `pyproject.toml` 解析、锁定传递依赖，生成覆盖 Python
+3.11-3.13、全部 extras 和目标平台标记的 `constraints/py311-313.txt`。Linux 环境脚本、
+Docker wheel 构建和 CI 使用同一文件，CI 重新生成后检查零差异。该文件是生成型供应链
+制品，不得手工编辑，也不得成为第二个人工依赖入口。
 
 共享 Provider 配置为空时表示未启用，也不会导入对应 SDK。配置存在但 extra 未安装时，
 必需 Provider 启动失败并回滚，可选 Provider 进入 degraded。Mongo URI、Redis URL、

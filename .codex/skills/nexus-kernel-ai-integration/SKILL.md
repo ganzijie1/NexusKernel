@@ -18,6 +18,8 @@ AI SDK 只在 `pyproject.toml` 的聚合 `ai` extra 中维护；不得新增 `re
   身份不得进入消息、Schema 或工具参数。
 - 先用 SDK fake 写失败测试，再实现消息角色、system/history/current turn、工具、usage、
   超时和取消映射；默认测试不得访问真实模型或依赖真实凭据。
+- 所有公开 timeout、TTL、轮询与 cleanup 预算同时拒绝 bool、NaN、正负无穷和非正数；
+  Pydantic 配置与直接构造入口必须使用相同的正有限数合同。
 - 输出统一为 assistant ChatMessage、ProviderId、模型名、finish reason 与 TokenUsage。
 - 工具只来自服务端 AgentToolSpec；使用 Draft 2020-12 校验完整 JSON Schema，并限制名称、
   handler 次数、轮数、超时、参数与 UTF-8 输出大小。单一绝对 deadline 覆盖有界严格 JSON

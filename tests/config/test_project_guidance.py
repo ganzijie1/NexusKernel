@@ -103,6 +103,30 @@ def test_guidance_documents_hardening_contracts() -> None:
     assert "晚到" in architecture + migration
     assert "Mount 前缀子树" in architecture
     assert "渐进式流式" in architecture + api
+    assert "dependencies" in readme + architecture + development + configuration
+    assert "模块映射顺序没有语义" in architecture + development
+    assert "不得读取 `self.config`" in development
+    assert "不能强制终止线程" in api
+    assert "constraints/py311-313.txt" in readme + development + configuration
+    assert "不可变能力快照" in architecture + development
+    assert "必需与可选 Provider" in architecture + development
+    assert "两两重叠" in architecture + api
+    assert "逐项" in architecture + api
+    assert "block_milliseconds" in development
+    assert "ttl_seconds" in development
+    assert "timeout=2" in docker
+    assert "10001:10001" in docker
+    assert "mongo:8.0@sha256" in docker
+    assert "redis:8.0-alpine@sha256" in docker
+    assert "不带 `--profile worker` 时只启动 API" in docker
+    assert (
+        "docker compose --env-file docker/.env.preprod "
+        "-f docker/docker-compose-preprod.yml --profile worker up -d"
+    ) in docker
+    assert (
+        "docker compose --env-file docker/.env.prod "
+        "-f docker/docker-compose-prod.yml --profile worker up -d"
+    ) in docker
     assert "NTFS ACL" in security
     assert "METADATA/WHEEL 单值字段" in readme + development
     assert "build tag" in readme + development
@@ -200,6 +224,16 @@ def test_project_skills_include_hardening_boundaries() -> None:
     assert "dev、preprod、prod" in config_skill
     assert "<ENV_PREFIX>_RUNTIME_EXTRAS" in delivery_skill
     assert "UID/GID 10001" in delivery_skill
+    assert "optional_dependencies" in module_skill
+    assert "constraints/py311-313.txt" in config_skill
+    assert "正有限数" in ai_skill
+    assert "大小门禁" in delivery_skill
+    assert "不可变能力快照" in module_skill
+    assert "必需与可选 Provider" in module_skill + config_skill
+    assert "两两重叠" in module_skill
+    assert "block_milliseconds" in config_skill
+    assert "timeout=2" in delivery_skill
+    assert "10001:10001" in delivery_skill
 
 
 def test_agents_file_is_concise_and_preserves_core_rules() -> None:

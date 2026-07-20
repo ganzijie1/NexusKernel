@@ -18,7 +18,18 @@
 
 ## 生命周期
 
-Kernel 先初始化 Provider，再按稳定拓扑注册和启动 Module。Provider 的异步 factory、
+配置中的 `dependencies` 与 `optional_dependencies` 是导入前清单，Module 类上的同名属性
+是运行时能力白名单，两处按集合严格一致。YAML 模块映射顺序没有语义；loader 在导入任何
+实现前检查缺失依赖、禁用依赖和循环，再以模块名为同级排序键，依次先导入并构造依赖、
+后导入并构造消费者。`app.modules` 聚合包与模块包初始化文件不得抢先导入实现，生产入口
+也不得在 loader 前加载具体 Module。跨模块静态导入只允许显式公共 `api`、`schema`、
+`event`、`protocol` 路径；包根、聚合导出和私有实现均属于禁止边界。
+
+Kernel 先初始化 Provider，再按同一稳定拓扑注册和启动 Module。Kernel 对程序化传入的
+Module 再次校验依赖图、类声明和实例声明；有 manifest 时还要求清单、类与实例三方一致。
+模块与 Provider 的必需、可选名称均不得为空、重复或重叠，必需与可选 Provider 必须互斥。
+Kernel 构造时生成不可变能力快照，后续修改 Module 属性不会改变拓扑、Context 权限、降级
+判断或生命周期行为。停止和回滚使用严格逆序。Provider 的异步 factory、
 实例校验与 `start()` 共用一次 cooperative deadline；同步 factory 必须非阻塞。必需资源
 失败会终止并逆序回滚，可选 Provider 或 Module 自身失败进入 `FAILED`。`DEGRADED` 只表示
 组件仍可调用但可选能力不完整，因此路由和代理允许 `READY/DEGRADED`。
@@ -52,19 +63,27 @@ Module 通过 `config_schema` 声明 strict/frozen 的 `ModuleConfig`，生命�
 及 sync/async 形态，并使用静态 descriptor 检查区分实例方法、staticmethod 和
 classmethod。注册期 accessor 可以返回处于 `REGISTERED` 的依赖代理用于缓存与装配，
 但 API 代理在每次调用时仍要求目标为 `READY/DEGRADED`，缓存 callable 也不能绕过停止。
+Module 保持无参构造；基类构造期不创建配置默认值，loader 在构造前验证 YAML 并在构造后
+一次性绑定。构造函数读取配置会使绑定失败，配置相关的纯内存装配应移入 `on_register()`，
+外部 I/O 应移入 `on_start()`。
 
 ## HTTP 与 AI
 
 Gateway 要求显式传入 settings、Kernel 和应用 Router，并统一检查 FastAPI 系统、
 内置、应用和模块路由的实际匹配集合冲突，包括嵌套 Router、Mount 前缀子树、动态参数、
-converter、catch-all 与尾斜杠。
+converter、catch-all 与尾斜杠。`int`、`float`、`uuid` converter 的匹配域两两重叠，任意
+组合都会在应用创建期 fail-fast，不能依赖 Router 注册顺序选路。
 中间件外到内固定为请求上下文、请求日志、指标、CORS、单一服务端截止时间、正文大小限制
 和应用，因此慢分块正文也受同一截止时间保护。响应 start/header/body 在有界规范化缓冲中
-合并，默认最多 10 MiB；最终 body 必须在 deadline 内生成，随后先提交 start/body，再释放
+合并，默认最多 10 MiB；响应头先逐项完成类型校验和预算预留，再复制到规范化缓冲，超限
+立即停止遍历。最终 body 必须在 deadline 内生成，随后先提交 start/body，再释放
 应用执行 BackgroundTask。提交后的网络发送和后台任务不再转换为 504，后台失败只记录
 `http_background_task_failed` 与低基数计数。超限返回 `response_too_large`，非法 ASGI
 响应返回 `invalid_response`；通用 Gateway 不提供渐进式流式响应语义。声明式模块路由
 发布请求/响应 OpenAPI schema；需要鉴权、请求头或业务异常映射的路由属于 `app/routes`。
+同步声明式 handler 通过工作线程执行，返回 awaitable 时仍在事件循环中等待；endpoint 和
+server deadline 都覆盖等待过程。超时只取消等待并丢弃晚到结果，不能终止已运行线程，
+因此带副作用的同步 handler 必须幂等并为外部调用设置自身 deadline。
 
 `openai_compatible` 与 `litellm` 实现 ModelClient；`google_adk` 基于 ADK 2.4 的
 `App + Runner` 实现 AgentRuntime 与 WorkflowRuntime。app 将 Request 交给

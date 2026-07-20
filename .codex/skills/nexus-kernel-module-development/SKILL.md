@@ -27,13 +27,20 @@ description: Use when creating, changing, or reviewing NexusKernel application m
 1. 搜索已有模块、公共契约、配置、直接调用方和测试，说明复用或新增理由。
 2. 先写失败测试，覆盖 schema、Protocol 越权、依赖拓扑和目标行为。
 3. 保持 Module 构造函数无参；通过 `config_schema` 声明 `ModuleConfig`，生命周期只接收
-   `ModuleContext` 并管理本模块资源。
+   `ModuleContext` 并管理本模块资源。构造函数不得读取 `self.config`；配置相关的纯内存
+   装配放入 `on_register()`，外部 I/O 放入 `on_start()`。
 4. 声明 required/optional 模块与 Provider；Context 的四个 accessor 只能访问已声明项。
+   模块依赖还必须同步写入 `config/modules.yaml` 的 `dependencies` 与
+   `optional_dependencies` 导入前清单，两处按集合严格一致。YAML 模块映射无序，loader
+   必须在实现导入前校验清单并按模块名稳定拓扑。
+   声明必须是 tuple，名称非空且无重复；模块不得自依赖，必需与可选 Provider 及模块依赖
+   分别互斥。Kernel 构造时保存不可变能力快照，后续属性改写不得改变权限或生命周期。
    注册期可取得 `REGISTERED` 依赖代理用于装配，但只能在目标 `READY/DEGRADED` 后调用。
    可选能力缺失使消费者降级，组件自身失败为 `FAILED`，必需资源失败必须回滚；禁止
    `ProviderSpec(required=True, enabled=False)`。
 5. 简单无鉴权接口使用 `HttpEndpointSpec`；鉴权、请求头或业务异常映射放入 `app/routes`。
    新路由不得与系统、应用、模块、嵌套 Router 或 Mount 前缀子树的实际匹配集合重叠。
+   `int`、`float`、`uuid` converter 的匹配域两两重叠；响应头必须逐项验证并预留缓冲预算。
    Gateway 在有界缓冲内以最终 body 为提交点；提交后 BackgroundTask 不再受响应 deadline
    改写。通用 Gateway 不提供渐进式流式响应语义。
 6. 通过 `get_worker_specs()` 声明 Worker，由 Kernel 构造期校验，ApplicationRuntime 在
@@ -51,3 +58,6 @@ Protocol 修改必须覆盖实例方法、staticmethod、classmethod descriptor 
 Provider factory 返回 candidate 后，仅合法无参 async `close()` 保证有界关闭一次；同步、
 缺失或非法 close 不调用并报告 `provider_cleanup_unavailable`。Module/Worker 停止未达到
 task 真实终态时必须保留同一 task 和依赖，显式重试继续等待，不能提前关闭 Provider。
+`app.modules` 及模块包初始化文件不得 eager import 具体 Module；跨模块只允许显式公共
+api/schema/event/protocol 路径，禁止导入其他模块的包根、聚合导出及 module、service、
+repository 或 worker 实现。

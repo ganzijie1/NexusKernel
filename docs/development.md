@@ -17,16 +17,30 @@ app/modules/<module_name>/
 
 1. 在 `module.py` 定义无参 Module、继承 `ModuleConfig` 的 strict/frozen schema，并把它
    赋给 `config_schema`；业务代码进入 services。
-2. 通过 `dependencies`、`optional_dependencies` 和 Provider 名声明依赖；跨模块只调用
-   生命周期参数 `ModuleContext` 返回的白名单 API 代理。
+2. 通过 Module 的 `dependencies`、`optional_dependencies` 和 Provider 名声明运行时
+   能力；跨模块只调用生命周期参数 `ModuleContext` 返回的白名单 API 代理。
 3. 在 `config/modules.yaml` 注册与 `Module.name` 一致的键、
-   `app.modules.<name>.module.<Class>` 类路径和私有配置。
+   `app.modules.<name>.module.<Class>` 类路径、私有配置，以及与 Module 属性按集合严格
+   一致的 `dependencies`、`optional_dependencies` 导入前清单。模块映射顺序没有语义。
 4. 无鉴权的简单 HTTP 接口使用 `HttpEndpointSpec`；鉴权或定制异常映射放到
    `app/routes` 与 `app/services`。
 5. 先测试 schema、Protocol 越权、拓扑、降级、回滚和停止，再写实现。
 
-禁止静态导入其他模块的私有 Service/Repository、访问 `Kernel._entries`、让模块自行
-创建或关闭共享 Provider，或把业务实现放进 `nexus_kernel`。
+跨模块静态导入只允许显式公共 `api`、`schema`、`event`、`protocol` 路径；禁止导入
+其他模块的包根、聚合导出及私有 Module/Service/Repository/Worker。也禁止访问
+`Kernel._entries`、让模块自行创建或关闭共享 Provider，或把业务实现放进
+`nexus_kernel`。
+
+`app.modules` 与模块包初始化文件必须零副作用或使用惰性导出，不得聚合导入具体 Module。
+loader 会在业务实现导入前校验清单，并按稳定拓扑完成 import、配置验证和无参构造；必需
+依赖缺失或禁用、循环、清单与类声明不一致都会 fail-fast。Module 构造函数只能建立与配置
+无关的安全占位值，不得读取 `self.config`；纯内存服务装配进入 `on_register()`，外部 I/O
+进入 `on_start()`。
+
+依赖和 Provider 声明必须是 tuple，名称不得为空或重复；模块不得自依赖，必需与可选
+Provider 及模块依赖分别互斥，Provider 名遵循 `[a-z][a-z0-9_]*`。Kernel 构造时校验类与
+实例声明，并保存不可变能力快照；不得依靠构造期或生命周期中改写属性来改变拓扑、权限或
+降级行为。
 
 `ModuleContext.require_module()`、`optional_module()`、`require_provider()` 和
 `optional_provider()` 都只能访问模块声明过的名字，未声明访问必须立即失败。模块通过
@@ -37,7 +51,8 @@ ApplicationRuntime 在 Kernel 启动后注册可运行模块的 Worker。
 
 Provider 只实现 `start`、`health_check`、`close`，由 app 装配 `ProviderSpec`。
 必需 Provider 失败阻断启动；可选 Provider 自身失败为 `FAILED`，依赖它的 Module 在仍可
-运行时为 `DEGRADED`；`required=True, enabled=False` 在配置和合同层都无效。factory 返回
+运行时为 `DEGRADED`；必需与可选 Provider 分类必须互斥，`required=True, enabled=False`
+在配置和合同层都无效。factory 返回
 candidate 后即把所有权交给 Registry；仅签名合法的异步 `close()` 在后续校验、start、
 timeout 或取消失败时获得独立预算内单次清理保证。同步、缺失或签名非法的 close 不调用，
 并报告 `provider_cleanup_unavailable`。Worker 通过 WorkerSpec 注册，必须协作响应 stop
@@ -50,7 +65,9 @@ task；只有 task 达到真实终态后才能继续关闭 Provider。需要硬�
 ## 基础设施适配器
 
 - Mongo 提供连接探测、DocumentStore ID CRUD、事务上下文和关闭。
-- Redis 提供连接探测、KV/TTL、Stream、消费组与确认；消费循环必须传播取消。
+- Redis 提供连接探测、KV/TTL、Stream、消费组与确认；`block_milliseconds` 和非空
+  `ttl_seconds` 只接受严格正整数，bool、float、零和负数必须在 client I/O 前失败；消费
+  循环必须传播取消。
 - PostgreSQL 基于 asyncpg 提供连接池、execute/fetch 和事务；不包含 ORM 或迁移。
 - Qdrant 提供连接探测、集合确保和 VectorStore CRUD；OTel 只负责通用追踪适配。
 
@@ -104,4 +121,6 @@ agent、run、session、Prompt、工具载荷或异常原文加入指标标签�
 与允许的顶层目录；Tag 集合必须匹配文件名。文件名含 build tag 时 `WHEEL` 必须有且
 仅有一个规范化后匹配的 `Build`，否则该字段必须省略。RECORD 摘要和大小必须匹配实际
 字节。不得跳过旧包、未知顶层目录和敏感文件检查。构建前清理 `build`、`dist` 和
-`*.egg-info`。
+`*.egg-info`。`constraints/py311-313.txt` 只能由项目固定的 uv 版本从 `pyproject.toml`
+重新生成，Linux 环境、Docker 和 CI 只能消费或验证该生成物，不得手工维护第二份版本
+清单。

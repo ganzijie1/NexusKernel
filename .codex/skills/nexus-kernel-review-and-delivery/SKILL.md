@@ -13,9 +13,13 @@ description: Use when reviewing NexusKernel diffs, Docker and Compose changes, G
 2. 核对 API/Worker 同镜像、非 root、role、env 示例、Compose profile 和无固定网络。
    Dockerfile 默认保持 `ai`，dev Compose 默认 `ai,mongo,redis`；preprod/prod 必须使用显式
    外部镜像且不定义本地基础设施。构建参数 `<ENV_PREFIX>_RUNTIME_EXTRAS` 只能使用项目
-   白名单，所有 Compose 命令使用对应 `--env-file`。
+   白名单，所有 Compose 命令使用对应 `--env-file`。preprod/prod 双角色必须显式使用
+   `10001:10001`，dev Mongo/Redis 必须固定经核验的多架构 OCI index digest。
 3. 核对 live/ready：模板允许 HTTP 200 degraded，监控必须读取 JSON 状态。
 4. 检查 CI 轮询有总超时和失败日志，失败后清理；真实 LLM 只由显式 Secret 触发。
+   单次健康请求必须有网络超时和有限重试，container job 具有总预算；default/full 镜像
+   分别执行大小门禁并记录 digest。三套 Compose API 探针同时使用 `urlopen` 的
+   `timeout=2` 与 Compose `timeout: 2s`。基础镜像与 CI 镜像使用可审计 digest 固定。
 5. 检查日志配置已接入且不输出凭据、Prompt、工具载荷、请求体或模型原始响应。
 6. 同步 README、Docker、架构、配置、API、安全文档和项目技能。
 
@@ -31,6 +35,8 @@ CRC 和顶层目录；文件名 build tag 与 `WHEEL` 的单值 `Build` 必须�
 省略该字段。仅能解压不代表制品合格。成品
 安装矩阵必须安装全部运行时 extras，执行关键 SDK import smoke 与 `pip check`。Python
 3.12/3.13 在 GitLab 矩阵完成前只标记为“已配置、待执行验证”，不得以静态配置代替结果。
+CI 还必须用固定 uv 从 `pyproject.toml` 重建 universal constraints 并验证零差异；该生成物
+不得替代 `pyproject.toml` 成为人工依赖来源。
 
 Findings 按 P0-P3 排序，包含文件行、触发条件、失败机制、影响和修复方向；没有 finding
 时列出未执行验证与剩余风险。

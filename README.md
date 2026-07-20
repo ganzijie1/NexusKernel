@@ -25,6 +25,7 @@ NexusKernel/
 │   ├── bootstrap.py           # 配置、Provider、Kernel、Worker 总装配
 │   └── launcher.py            # API/Worker 同镜像入口
 ├── config/                    # application、modules、providers 配置
+├── constraints/               # 从 pyproject.toml 生成的跨版本传递依赖约束
 ├── docker/                    # Dockerfile、Compose 与脱敏 env 示例
 ├── scripts/                   # 环境、初始化、安全和 wheel 校验脚本
 └── tests/                     # 架构、合同、单元、部署与 smoke 测试
@@ -51,8 +52,14 @@ app/modules/<module_name>/
 - `api/contracts.py` 只定义对其他模块开放的 Protocol；schemas 与 endpoint 声明归 `api/`。
 - 业务规则归 `services/`，存储访问归 `repositories.py`，协作式后台任务归 `workers.py`。
 - 简单模块不创建空目录；目录名、`Module.name` 与 `config/modules.yaml` 键必须一致。
+- `app.modules` 与各模块包初始化文件不得主动导入具体实现；运行入口只通过
+  `app.modules.<name>.module.<Class>` 完整路径加载模块。
+- 必需和可选模块依赖同时写入 `config/modules.yaml` 的 `dependencies`、
+  `optional_dependencies` 与 Module 同名属性，两处按集合严格一致。YAML 模块映射顺序
+  没有语义；loader 在导入实现前校验依赖图，并按模块名稳定地先导入依赖。
 - 每个 Module 用 `config_schema` 声明继承 `ModuleConfig` 的 strict/frozen 配置模型；配置只
-  验证一次，生命周期只接收受限的 `ModuleContext`。
+  验证并绑定一次。无参构造函数不得读取配置；纯内存装配放入 `on_register()`，外部 I/O
+  放入 `on_start()`，生命周期只接收受限的 `ModuleContext`。
 - `ModuleContext.require_module()`、`optional_module()`、`require_provider()` 和
   `optional_provider()` 只能访问 Module 预先声明的白名单；Module 不持有 Kernel。
 - 注册期可以取得处于 `REGISTERED` 的依赖代理用于装配，但代理只有在目标进入
@@ -78,7 +85,9 @@ bash scripts/init_project.sh --name "My Service" --slug my-service --env-prefix 
 `pyproject.toml` 是唯一依赖来源，项目不维护 `requirements.txt`，避免两份版本清单
 漂移。Core 只安装基础 Web 能力；`ai`、`mongo`、`redis`、`postgres`、`qdrant`、
 `otel`、`dev` 通过 extra 按需安装。精确直接依赖不等于传递依赖锁定；需要完全可重复
-构建时应另行引入生成型 constraints 或标准 lock 文件。
+构建时使用固定 uv 版本从 `pyproject.toml` 生成的 `constraints/py311-313.txt`。该文件
+覆盖 Python 3.11-3.13 和全部 extras，由 Linux 环境脚本、Docker 与 CI 消费并检查漂移，
+禁止手工编辑或把它当成第二个依赖来源。
 
 `ai` 当前固定 Google ADK 2.4 与 Google Gen AI 2.12；运行时使用 ADK `App + Runner`，
 同时提供兼容的同步 Chat 和默认关闭的 Graph/Task 多智能体 Agent Runs。Core 直接固定

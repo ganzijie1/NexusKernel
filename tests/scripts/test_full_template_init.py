@@ -1,20 +1,13 @@
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
-
-from scripts.security_scan import scan
-from scripts.verify_wheel import load_project_contract, validate_wheel
-
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -39,6 +32,7 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
             ".git",
             ".venv-win",
             ".venv-linux",
+            ".venv-macos",
             ".pytest_cache",
             ".mypy_cache",
             ".ruff_cache",
@@ -48,6 +42,26 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
             "*.egg-info",
         ),
     )
+    repository = subprocess.run(
+        ["git", "init", "--quiet"],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=30,
+    )
+    assert repository.returncode == 0, repository.stderr
+    inventory = subprocess.run(
+        ["git", "add", "--all"],
+        cwd=target,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=30,
+    )
+    assert inventory.returncode == 0, inventory.stderr
     arguments = [
         _bash(),
         "scripts/init_project.sh",
@@ -60,6 +74,10 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
         "--port",
         "9124",
     ]
+    skill_metadata = {
+        path: path.read_bytes()
+        for path in (target / ".codex/skills").rglob("agents/openai.yaml")
+    }
 
     first = subprocess.run(
         arguments,
@@ -68,6 +86,7 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
         text=True,
         encoding="utf-8",
         check=False,
+        timeout=60,
     )
     second = subprocess.run(
         arguments,
@@ -76,6 +95,7 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
         text=True,
         encoding="utf-8",
         check=False,
+        timeout=60,
     )
 
     assert first.returncode == 0, first.stderr
@@ -93,6 +113,7 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
     readme = (target / "README.md").read_text(encoding="utf-8")
     dockerfile = (target / "docker/Dockerfile").read_text(encoding="utf-8")
     compose = (target / "docker/docker-compose-dev.yml").read_text(encoding="utf-8")
+    pipeline = (target / ".gitlab-ci.yml").read_text(encoding="utf-8")
     assert "${ATLAS_PORT:-9124}" in application
     assert "ATLAS_AI_API_KEY" in modules
     assert "ATLAS_MONGO_DSN" in providers
@@ -102,9 +123,14 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
     assert "EXPOSE 9124" in dockerfile
     assert "ARG ATLAS_RUNTIME_EXTRAS=ai" in dockerfile
     assert "${ATLAS_PORT:-9124}:${ATLAS_PORT:-9124}" in compose
+    for role in ("default-api", "default-worker", "full-api", "full-worker"):
+        assert f"atlas-service-{role}" in pipeline
+    assert "nexus-kernel-starter" not in pipeline
     product_documents = [
+        target / "AGENTS.md",
         target / "README.md",
         target / "docker/README.md",
+        *(target / ".codex/skills").rglob("SKILL.md"),
         *(
             path
             for path in (target / "docs").rglob("*.md")
@@ -124,90 +150,126 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
     for new_value in ("Atlas Service", "atlas-service", "ATLAS", "9124"):
         assert new_value in documentation
     assert "nexus_kernel" in documentation
+    assert {path: path.read_bytes() for path in skill_metadata} == skill_metadata
     for profile in ("dev", "preprod", "prod"):
         generated = target / f"docker/.env.{profile}"
         assert generated.is_file()
+        assert not generated.is_symlink()
         assert "ATLAS_PORT=9124" in generated.read_text(encoding="utf-8")
-        assert generated.stat().st_mode & 0o777 == 0o600
+        if os.name != "nt":
+            assert generated.stat().st_mode & 0o777 == 0o600
     marker = json.loads(
         (target / ".nexus-kernel-initialized").read_text(encoding="utf-8")
     )
     assert marker["slug"] == "atlas-service"
-    from scripts import security_scan
+    isolated_environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("NEXUS_KERNEL_", "ATLAS_"))
+        and key != "RUN_REAL_LLM_SMOKE"
+    }
+    isolated_environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    security_result = subprocess.run(
+        [sys.executable, "scripts/security_scan.py"],
+        cwd=target,
+        env=isolated_environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=60,
+    )
+    assert security_result.returncode == 0, security_result.stderr
 
-    original_root = security_scan.ROOT
-    try:
-        security_scan.ROOT = target
-        assert scan() == []
-    finally:
-        security_scan.ROOT = original_root
+    docker_cli = shutil.which("docker")
+    if docker_cli is not None:
+        compose_environment = {
+            **isolated_environment,
+            "ATLAS_IMAGE": "atlas-service:initializer-contract",
+        }
+        for profile in ("dev", "preprod", "prod"):
+            compose_result = subprocess.run(
+                [
+                    docker_cli,
+                    "compose",
+                    "--env-file",
+                    f"docker/.env.{profile}",
+                    "-f",
+                    f"docker/docker-compose-{profile}.yml",
+                    "config",
+                    "--quiet",
+                ],
+                cwd=target,
+                env=compose_environment,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                check=False,
+                timeout=60,
+            )
+            assert compose_result.returncode == 0, compose_result.stderr
+    else:
+        for profile in ("dev", "preprod", "prod"):
+            assert f"--env-file docker/.env.{profile}.example" in pipeline
 
     contract_result = subprocess.run(
         [
             sys.executable,
             "-m",
             "pytest",
+            "-m",
+            "not real_llm",
             "-p",
             "no:cacheprovider",
-            "tests/config/test_project_tooling.py::test_pyproject_defines_build_and_core_project_contract",
-            "tests/deployment/test_artifacts.py::test_dockerfile_is_multistage_non_root_and_role_driven",
-            "tests/deployment/test_artifacts.py::test_compose_files_are_parseable_and_have_no_external_or_fixed_networks",
-            "tests/deployment/test_artifacts.py::test_gitlab_pipeline_has_no_push_or_deploy_commands",
-            "tests/deployment/test_artifacts.py::test_gitlab_installs_built_wheel_with_all_runtime_extras_on_all_pythons",
-            "tests/deployment/test_artifacts.py::test_gitlab_container_smoke_builds_all_runtime_extras",
+            "--ignore=tests/scripts/test_full_template_init.py",
             "-q",
         ],
         cwd=target,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        env=isolated_environment,
         capture_output=True,
         text=True,
         encoding="utf-8",
         check=False,
+        timeout=600,
     )
     assert contract_result.returncode == 0, (
         contract_result.stdout + contract_result.stderr
     )
 
-    contract = load_project_contract(target)
-    dist_info = contract.dist_info_directory
-    wheel = target / "atlas_service-0.2.0-py3-none-any.whl"
-    entries = {
-        "nexus_kernel/__init__.py": "",
-        "app/__init__.py": "",
-        f"{dist_info}/METADATA": (
-            "Metadata-Version: 2.4\n"
-            "Name: atlas-service\n"
-            "Version: 0.2.0\n"
-            "Requires-Python: >=3.11,<3.14\n"
-            + "".join(
-                f"Requires-Dist: {dependency}\n" for dependency in contract.dependencies
-            )
-            + "".join(
-                f"Provides-Extra: {extra}\n" for extra in contract.optional_dependencies
-            )
-            + "".join(
-                f'Requires-Dist: {dependency}; extra == "{extra}"\n'
-                for extra, dependencies in contract.optional_dependencies.items()
-                for dependency in dependencies
-            )
-            + "\n"
-        ),
-        f"{dist_info}/WHEEL": (
-            "Wheel-Version: 1.0\n"
-            "Generator: initializer-test\n"
-            "Root-Is-Purelib: true\n"
-            "Tag: py3-none-any\n\n"
-        ),
-    }
-    record = f"{dist_info}/RECORD"
-    rows = []
-    for name, content in entries.items():
-        data = content.encode("utf-8")
-        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=")
-        rows.append(f"{name},sha256={digest.decode('ascii')},{len(data)}\n")
-    entries[record] = "".join((*rows, f"{record},,\n"))
-    with ZipFile(wheel, "w", ZIP_DEFLATED) as archive:
-        for name, content in entries.items():
-            archive.writestr(name, content)
-
-    assert validate_wheel(wheel, contract) == []
+    for generated in (target / "build", target / "dist"):
+        shutil.rmtree(generated, ignore_errors=True)
+    for egg_info in target.glob("*.egg-info"):
+        shutil.rmtree(egg_info)
+    build_result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--wheel",
+            "--no-isolation",
+            "--outdir",
+            "dist",
+        ],
+        cwd=target,
+        env=isolated_environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=180,
+    )
+    assert build_result.returncode == 0, build_result.stdout + build_result.stderr
+    assert [path.name for path in (target / "dist").glob("*.whl")] == [
+        "atlas_service-0.2.0-py3-none-any.whl"
+    ]
+    wheel_result = subprocess.run(
+        [sys.executable, "scripts/verify_wheel.py", "dist"],
+        cwd=target,
+        env=isolated_environment,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+        timeout=60,
+    )
+    assert wheel_result.returncode == 0, wheel_result.stderr

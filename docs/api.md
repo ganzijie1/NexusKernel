@@ -100,11 +100,18 @@ Prometheus 指标使用配置的 prefix，Agent Runs 指标包括
 
 单一 server timeout 覆盖无 Content-Length 的正文接收、大小限制、下游处理和最终响应
 body 生成；超时响应仍经过 CORS、request/trace ID、日志与指标中间件。start/header/body
-先进入默认 10 MiB 的规范化缓冲，最终 body 到达后先提交响应，再运行 BackgroundTask。
+先进入默认 10 MiB 的规范化缓冲；响应头逐项完成类型检查和预算预留后才复制，超限时立即
+停止遍历并返回稳定错误。最终 body 到达后先提交响应，再运行 BackgroundTask。
 提交后的发送或后台工作不会被改写为 504；后台失败只产生稳定日志与指标。响应缓冲超限
 返回 `500 response_too_large`，重复 start、未知扩展或非法消息返回
 `500 invalid_response`。应用 Router 不应依赖渐进式流式下发。系统、内置、应用和模块
 路由若实际匹配集合重叠，会在启动期返回安全配置错误而不是依赖注册顺序选路；嵌套
-Router 会递归展开，Mount 视为占用全部 HTTP 方法的前缀子树。
+Router 会递归展开，Mount 视为占用全部 HTTP 方法的前缀子树。`int`、`float` 与 `uuid`
+converter 的匹配域两两重叠，任意组合都会在应用创建期被拒绝。
+
+声明式模块路由允许同步 handler，但 Gateway 会在线程中调用它；同步函数返回 awaitable
+时继续等待该 awaitable。endpoint timeout 和 server timeout 都会返回现有
+`504 request_timeout`，但只能停止等待，不能强制终止线程。超时后的返回值不会提交，带
+副作用的同步 handler 必须幂等，并为线程内的外部调用设置更短的独立 deadline。
 
 客户端可传符合格式的 `X-Request-ID` 与 `X-Trace-ID`；否则中间件生成新值并写入响应。
