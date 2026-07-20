@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TypeAlias
 
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.errors import WorkerError
 
 
@@ -37,8 +38,9 @@ class WorkerSpec:
             raise ValueError("worker name must be a stable lowercase identifier")
         if not callable(self.runner):
             raise ValueError("worker runner must be callable")
-        if self.shutdown_timeout_seconds <= 0:
-            raise ValueError("worker shutdown timeout must be positive")
+        require_positive_finite_number(
+            self.shutdown_timeout_seconds, "worker shutdown timeout"
+        )
 
 
 @dataclass(frozen=True, slots=True)

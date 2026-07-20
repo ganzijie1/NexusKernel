@@ -147,6 +147,18 @@ def test_tool_executor_rejects_duplicate_names_and_invalid_limits() -> None:
         _tool(None)
 
 
+@pytest.mark.parametrize(
+    "timeout", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_tool_executor_rejects_non_positive_finite_timeout(timeout: object) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        ToolExecutor(
+            (),
+            identity=_IDENTITY,
+            timeout_seconds=timeout,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.asyncio
 async def test_tool_executor_rejects_non_strict_and_oversized_arguments() -> None:
     calls: list[dict[str, Any]] = []

@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol, TypeAlias
 
+from nexus_kernel._validation import require_positive_finite_number
+
 
 class ProviderState(StrEnum):
     REGISTERED = "registered"
@@ -46,5 +48,4 @@ class ProviderSpec:
             raise ValueError("provider name must be a stable lowercase identifier")
         if self.required and not self.enabled:
             raise ValueError("required provider cannot be disabled")
-        if self.timeout_seconds <= 0:
-            raise ValueError("provider timeout_seconds must be positive")
+        require_positive_finite_number(self.timeout_seconds, "provider timeout_seconds")

@@ -56,6 +56,14 @@ def test_metrics_registry_is_isolated_and_renders_cached_prometheus_data() -> No
     assert b'sample_component_health{component="chat",kind="module"} 0.0' in first
 
 
+@pytest.mark.parametrize(
+    "ttl", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_metrics_registry_rejects_non_positive_finite_cache_ttl(ttl: object) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        MetricsRegistry("sample", cache_ttl_seconds=ttl)  # type: ignore[arg-type]
+
+
 def test_metrics_mutation_invalidates_cache() -> None:
     metrics = MetricsRegistry("sample", cache_ttl_seconds=10)
     first = metrics.render()

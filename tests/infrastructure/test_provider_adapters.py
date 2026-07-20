@@ -9,6 +9,7 @@ from typing import Any
 
 import pytest
 
+from nexus_kernel._validation import require_positive_integer
 from nexus_kernel.infrastructure import (
     MongoDocumentStore,
     QdrantVectorStore,
@@ -144,6 +145,7 @@ class _RedisClient:
         self.values: dict[str, str] = {}
         self.groups: list[tuple[str, str]] = []
         self.closed = False
+        self.io_calls: list[str] = []
 
     async def ping(self) -> bool:
         return True
@@ -152,6 +154,7 @@ class _RedisClient:
         return self.values.get(key)
 
     async def set(self, key: str, value: str, **kwargs: Any) -> bool:
+        self.io_calls.append("set")
         self.values[key] = value
         self.last_set = (key, value, kwargs)
         return True
@@ -173,6 +176,7 @@ class _RedisClient:
         return "1-0"
 
     async def xreadgroup(self, *args: Any, **kwargs: Any) -> list[Any]:
+        self.io_calls.append("xreadgroup")
         return [("events", [("1-0", {"payload": '{"ok": true}'})])]
 
     async def xack(self, topic: str, group: str, message_id: str) -> int:
@@ -203,6 +207,52 @@ async def test_redis_lifecycle_kv_ttl_and_stream_group() -> None:
     assert client.groups == [("events", "workers")]
     assert message.payload == {"ok": True}
     assert client.closed is True
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, 0, -1, 1.0, float("nan"), float("inf"), float("-inf"), "1", None],
+)
+def test_positive_integer_validator_rejects_invalid_values_without_echoing(
+    value: object,
+) -> None:
+    with pytest.raises(ValueError) as captured:
+        require_positive_integer(value, "redis value")
+
+    assert str(captured.value) == "redis value must be a positive integer"
+
+
+@pytest.mark.parametrize(
+    "block_milliseconds",
+    [True, False, 0, -1, 1.0, float("nan"), float("inf"), float("-inf"), "1", None],
+)
+def test_redis_rejects_invalid_block_interval_before_client_io(
+    block_milliseconds: Any,
+) -> None:
+    client = _RedisClient()
+
+    with pytest.raises(
+        ValueError, match="^block_milliseconds must be a positive integer$"
+    ):
+        RedisStreamQueue(client, block_milliseconds=block_milliseconds)
+
+    assert client.io_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ttl_seconds",
+    [True, False, 0, -1, 1.0, float("nan"), float("inf"), float("-inf"), "1"],
+)
+async def test_redis_rejects_invalid_ttl_before_client_io(ttl_seconds: Any) -> None:
+    client = _RedisClient()
+    queue = RedisStreamQueue(client)
+
+    with pytest.raises(ValueError, match="^ttl_seconds must be a positive integer$"):
+        await queue.set("key", "value", ttl_seconds=ttl_seconds)
+
+    assert client.io_calls == []
+    assert client.values == {}
 
 
 @pytest.mark.asyncio

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from typing import Any, Protocol
 
 import fastapi
 import pytest
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, FastAPI, Request
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ConfigDict
 from starlette.background import BackgroundTask
@@ -18,6 +19,7 @@ from app.modules.example import ExampleModule
 from nexus_kernel.config import ApplicationSettings
 from nexus_kernel.errors import ConfigError
 from nexus_kernel.gateway import create_app
+from nexus_kernel.gateway.app import ApiError, _build_endpoint
 from nexus_kernel.gateway.middleware import RequestTimeoutMiddleware
 from nexus_kernel.kernel import HttpEndpointSpec, Kernel, LoadedModule, Module
 from nexus_kernel.observability import MetricsRegistry
@@ -206,6 +208,141 @@ def test_declarative_route_timeout_returns_504() -> None:
 
     assert response.status_code == 504
     assert response.json()["error"]["code"] == "request_timeout"
+
+
+@pytest.mark.asyncio
+async def test_sync_declarative_handler_runs_in_thread_and_awaits_returned_value() -> (
+    None
+):
+    event_loop_thread_id = threading.get_ident()
+    handler_thread_ids: list[int] = []
+
+    def handler(request: EmptyRequest) -> Any:
+        handler_thread_ids.append(threading.get_ident())
+
+        async def finish() -> dict[str, bool]:
+            await asyncio.sleep(0)
+            return {"done": True}
+
+        return finish()
+
+    endpoint = _build_endpoint(
+        handler,
+        HttpEndpointSpec(
+            path="/api/v1/sync-awaitable",
+            methods=("POST",),
+            target_api="wait",
+            request_schema=EmptyRequest,
+            timeout_seconds=1.0,
+        ),
+    )
+    response = await endpoint(
+        Request({"type": "http", "method": "POST", "path": "/"}),
+        EmptyRequest(),
+    )
+
+    assert response.status_code == 200
+    assert json.loads(response.body)["data"] == {"done": True}
+    assert handler_thread_ids
+    assert handler_thread_ids[0] != event_loop_thread_id
+
+
+@pytest.mark.asyncio
+async def test_sync_declarative_handler_timeout_discards_late_result() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def handler(request: EmptyRequest) -> dict[str, bool]:
+        started.set()
+        release.wait(timeout=1)
+        finished.set()
+        return {"late": True}
+
+    endpoint = _build_endpoint(
+        handler,
+        HttpEndpointSpec(
+            path="/api/v1/blocking-sync",
+            methods=("POST",),
+            target_api="wait",
+            request_schema=EmptyRequest,
+            timeout_seconds=0.01,
+        ),
+    )
+    with pytest.raises(ApiError) as captured:
+        await endpoint(
+            Request({"type": "http", "method": "POST", "path": "/"}),
+            EmptyRequest(),
+        )
+
+    assert started.is_set()
+    assert captured.value.status_code == 504
+    assert captured.value.code == "request_timeout"
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 1)
+    assert "late" not in captured.value.message
+
+
+@pytest.mark.asyncio
+async def test_global_request_timeout_bounds_sync_declarative_handler() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def handler(request: EmptyRequest) -> dict[str, bool]:
+        started.set()
+        release.wait(timeout=1)
+        finished.set()
+        return {"late": True}
+
+    endpoint = _build_endpoint(
+        handler,
+        HttpEndpointSpec(
+            path="/api/v1/globally-bounded-sync",
+            methods=("POST",),
+            target_api="wait",
+            request_schema=EmptyRequest,
+        ),
+    )
+
+    async def application(scope: Scope, receive: Any, send: Any) -> None:
+        response = await endpoint(Request(scope, receive), EmptyRequest())
+        await response(scope, receive, send)
+
+    middleware = RequestTimeoutMiddleware(
+        application,
+        timeout_seconds=0.01,
+        max_response_buffer_bytes=1024,
+        metrics=MetricsRegistry("sync_global_timeout", cache_ttl_seconds=1),
+    )
+    request_pending = True
+
+    async def receive() -> Message:
+        nonlocal request_pending
+        if request_pending:
+            request_pending = False
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    messages: list[Message] = []
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+
+    await middleware(_http_scope(), receive, send)
+
+    assert started.is_set()
+    release.set()
+    assert await asyncio.to_thread(finished.wait, 1)
+    await asyncio.sleep(0)
+    assert [message["type"] for message in messages] == [
+        "http.response.start",
+        "http.response.body",
+    ]
+    assert messages[0]["status"] == 504
+    payload = json.loads(messages[1]["body"])
+    assert payload["error"]["code"] == "request_timeout"
+    assert "late" not in payload
 
 
 class OptionalRouteApi(Protocol):
@@ -579,6 +716,33 @@ async def test_empty_response_chunks_cannot_starve_server_deadline() -> None:
 
 
 @pytest.mark.asyncio
+async def test_response_header_limit_stops_before_copying_later_headers() -> None:
+    visited: list[tuple[bytes, bytes]] = []
+
+    class TrackingHeaders(list[tuple[bytes, bytes]]):
+        def __iter__(self):
+            for header in super().__iter__():
+                visited.append(header)
+                yield header
+
+    headers = TrackingHeaders(
+        [
+            (b"x-large", b"0123456789"),
+            (b"x-later", b"must-not-be-copied"),
+        ]
+    )
+
+    async def application(scope: Scope, receive: Any, send: Any) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": headers})
+
+    messages, _ = await _run_timeout_middleware(application, limit=8)
+
+    assert messages[0]["status"] == 500
+    assert _message_payload(messages)["error"]["code"] == "response_too_large"
+    assert visited == [headers[0]]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("invalid_kind", ["duplicate_start", "extension", "no_body"])
 async def test_invalid_asgi_responses_fail_closed(invalid_kind: str) -> None:
     async def application(scope: Scope, receive: Any, send: Any) -> None:
@@ -666,50 +830,43 @@ def test_gateway_treats_unknown_converters_as_overlapping(
         )
 
 
-def test_gateway_allows_disjoint_known_converter_domains() -> None:
-    integer = APIRouter()
-    identifier = APIRouter()
+@pytest.mark.parametrize(
+    ("first_converter", "second_converter"),
+    [
+        ("int", "float"),
+        ("float", "int"),
+        ("int", "uuid"),
+        ("uuid", "int"),
+        ("float", "uuid"),
+        ("uuid", "float"),
+    ],
+)
+def test_gateway_rejects_overlapping_numeric_and_uuid_converter_domains(
+    first_converter: str, second_converter: str
+) -> None:
+    first = APIRouter()
+    second = APIRouter()
 
-    @integer.get("/api/v1/objects/{value:int}")
-    async def integer_object(value: int) -> dict[str, str]:
-        return {"kind": "integer"}
+    async def first_value(value: Any) -> dict[str, Any]:
+        return {"value": value}
 
-    @identifier.get("/api/v1/objects/{value:uuid}")
-    async def uuid_object(value: Any) -> dict[str, str]:
-        return {"kind": "uuid"}
+    async def second_value(value: Any) -> dict[str, Any]:
+        return {"value": value}
 
-    app = create_app(
-        settings=_settings(),
-        kernel=Kernel([]),
-        routers=(integer, identifier),
+    first.add_api_route(
+        f"/api/v1/values/{{value:{first_converter}}}", first_value, methods=["GET"]
     )
-    with TestClient(app, raise_server_exceptions=False) as client:
-        integer_response = client.get("/api/v1/objects/123")
-        uuid_response = client.get(
-            "/api/v1/objects/12345678-1234-1234-1234-123456789abc"
-        )
-
-    assert integer_response.json() == {"kind": "integer"}
-    assert uuid_response.json() == {"kind": "uuid"}
-
-
-def test_gateway_rejects_overlapping_numeric_converter_domains() -> None:
-    integer = APIRouter()
-    floating = APIRouter()
-
-    @integer.get("/api/v1/numbers/{value:int}")
-    async def integer_number(value: int) -> dict[str, int]:
-        return {"value": value}
-
-    @floating.get("/api/v1/numbers/{value:float}")
-    async def floating_number(value: float) -> dict[str, float]:
-        return {"value": value}
+    second.add_api_route(
+        f"/api/v1/values/{{value:{second_converter}}}",
+        second_value,
+        methods=["GET"],
+    )
 
     with pytest.raises(ConfigError, match="duplicated"):
         create_app(
             settings=_settings(),
             kernel=Kernel([]),
-            routers=(integer, floating),
+            routers=(first, second),
         )
 
 

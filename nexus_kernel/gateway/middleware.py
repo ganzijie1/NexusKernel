@@ -326,16 +326,14 @@ class _BufferedHttpResponse:
         ):
             raise _InvalidResponse from None
         copied_headers: list[tuple[bytes, bytes]] = []
-        header_bytes = 0
         for header in headers:
             if not isinstance(header, (list, tuple)) or len(header) != 2:
                 raise _InvalidResponse from None
             name, value = header
             if not isinstance(name, bytes) or not isinstance(value, bytes):
                 raise _InvalidResponse from None
+            self._reserve(len(name) + len(value))
             copied_headers.append((name, value))
-            header_bytes += len(name) + len(value)
-        self._reserve(header_bytes)
         self._start = {
             "type": "http.response.start",
             "status": status,

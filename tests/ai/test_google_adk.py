@@ -103,6 +103,38 @@ def _request() -> ChatRequest:
     )
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "timeout_seconds",
+        "tool_timeout_seconds",
+        "session_ttl_seconds",
+        "session_cleanup_timeout_seconds",
+    ],
+)
+@pytest.mark.parametrize(
+    "value", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_adk_rejects_non_positive_finite_timeouts_and_ttl(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        GoogleAdkRuntime(
+            api_key="secret",  # security-test-fixture
+            model="model",
+            backend=FakeAdkBackend(_result()),  # security-test-fixture
+            **{field: value},
+        )
+
+
+@pytest.mark.parametrize(
+    "ttl", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_adk_memory_store_rejects_non_positive_finite_ttl(ttl: object) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        BoundedMemoryAdkSessionStore(ttl_seconds=ttl)  # type: ignore[arg-type]
+
+
 @pytest.mark.asyncio
 async def test_adk_workflow_runtime_isolates_application_sessions_and_cleanup() -> None:
     application = AdkApplicationSpec(

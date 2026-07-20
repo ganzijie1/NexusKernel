@@ -7,11 +7,13 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
+from nexus_kernel._validation import require_positive_integer
 from nexus_kernel.infrastructure.contracts import QueueMessage
 
 
 class RedisStreamQueue:
     def __init__(self, client: Any, *, block_milliseconds: int = 1000) -> None:
+        require_positive_integer(block_milliseconds, "block_milliseconds")
         self._client = client
         self._block_milliseconds = block_milliseconds
 
@@ -36,7 +38,10 @@ class RedisStreamQueue:
     async def set(
         self, key: str, value: str, *, ttl_seconds: int | None = None
     ) -> bool:
-        options = {} if ttl_seconds is None else {"ex": ttl_seconds}
+        options: dict[str, int] = {}
+        if ttl_seconds is not None:
+            require_positive_integer(ttl_seconds, "ttl_seconds")
+            options["ex"] = ttl_seconds
         return bool(await self._client.set(key, value, **options))
 
     async def delete(self, key: str) -> bool:

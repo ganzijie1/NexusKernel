@@ -137,6 +137,23 @@ def test_worker_spec_requires_stable_name(name: str) -> None:
         WorkerSpec(name, runner)
 
 
+@pytest.mark.parametrize(
+    "timeout", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_worker_spec_rejects_non_positive_finite_shutdown_timeout(
+    timeout: object,
+) -> None:
+    async def runner(stop_event: asyncio.Event) -> None:
+        return None
+
+    with pytest.raises(ValueError, match="positive finite"):
+        WorkerSpec(
+            "worker",
+            runner,
+            shutdown_timeout_seconds=timeout,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.asyncio
 async def test_required_worker_failure_aborts_supervisor_start() -> None:
     async def failing_runner(stop_event: asyncio.Event) -> None:

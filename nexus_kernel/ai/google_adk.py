@@ -19,6 +19,10 @@ from jsonschema.exceptions import (  # type: ignore[import-untyped]
 )
 from jsonschema.validators import Draft202012Validator  # type: ignore[import-untyped]
 
+from nexus_kernel._validation import (
+    is_positive_finite_number,
+    require_positive_finite_number,
+)
 from nexus_kernel.ai._closing import (
     ActiveCallGate,
     CallAdmissionError,
@@ -1786,10 +1790,9 @@ class GoogleAdkRuntime:
             raise ValueError("model must not be empty")
         if not adk_app_name.strip():
             raise ValueError("adk_app_name must not be empty")
-        if timeout_seconds <= 0:
-            raise ValueError("AI timeout must be positive")
-        if tool_timeout_seconds <= 0:
-            raise ValueError("tool timeout must be positive")
+        require_positive_finite_number(timeout_seconds, "AI timeout")
+        require_positive_finite_number(tool_timeout_seconds, "tool timeout")
+        require_positive_finite_number(session_ttl_seconds, "session TTL")
         if (
             max_tool_rounds < 1
             or max_tool_calls < 1
@@ -1803,8 +1806,9 @@ class GoogleAdkRuntime:
             or not 1 <= max_workflow_concurrency <= 4
         ):
             raise ValueError("workflow concurrency must be between 1 and 4")
-        if session_cleanup_timeout_seconds <= 0:
-            raise ValueError("session cleanup timeout must be positive")
+        require_positive_finite_number(
+            session_cleanup_timeout_seconds, "session cleanup timeout"
+        )
         if session_cleanup_timeout_seconds > timeout_seconds:
             raise ValueError("session cleanup timeout must not exceed the AI timeout")
         self._api_key = api_key
@@ -1946,12 +1950,7 @@ class GoogleAdkRuntime:
         effective_timeout = (
             self.timeout_seconds if timeout_seconds is None else timeout_seconds
         )
-        if (
-            isinstance(effective_timeout, bool)
-            or not isinstance(effective_timeout, int | float)
-            or not math.isfinite(effective_timeout)
-            or effective_timeout <= 0
-        ):
+        if not is_positive_finite_number(effective_timeout):
             raise ValueError("workflow timeout must be positive and finite")
         try:
             deadline = asyncio.get_running_loop().time() + effective_timeout

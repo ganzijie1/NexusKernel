@@ -65,6 +65,12 @@ class ApiError(Exception):
         self.status_code = status_code
 
 
+def _consume_late_handler_result(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    task.exception()
+
+
 def _serialize_result(result: Any, response_schema: Any) -> Any:
     if response_schema is None:
         return result
@@ -91,19 +97,39 @@ def _build_endpoint(
                     )
                 arguments = (payload,)
 
-            result = handler(*arguments)
-            if inspect.isawaitable(result):
-                if spec.timeout_seconds is None:
-                    result = await result
+            handler_is_async = inspect.iscoroutinefunction(handler)
+
+            async def invoke() -> Any:
+                if handler_is_async:
+                    result = handler(*arguments)
                 else:
-                    try:
-                        result = await asyncio.wait_for(
-                            result, timeout=spec.timeout_seconds
-                        )
-                    except TimeoutError:
-                        raise ApiError(
-                            "request_timeout", "Request timed out.", 504
-                        ) from None
+                    result = await asyncio.to_thread(handler, *arguments)
+                if inspect.isawaitable(result):
+                    return await result
+                return result
+
+            late_task: asyncio.Task[Any] | None = None
+            invocation: Any
+            if handler_is_async:
+                invocation = invoke()
+            else:
+                late_task = asyncio.create_task(invoke())
+                invocation = asyncio.shield(late_task)
+            try:
+                if spec.timeout_seconds is None:
+                    result = await invocation
+                else:
+                    result = await asyncio.wait_for(
+                        invocation, timeout=spec.timeout_seconds
+                    )
+            except TimeoutError:
+                if late_task is not None:
+                    late_task.add_done_callback(_consume_late_handler_result)
+                raise ApiError("request_timeout", "Request timed out.", 504) from None
+            except asyncio.CancelledError:
+                if late_task is not None:
+                    late_task.add_done_callback(_consume_late_handler_result)
+                raise
             serialized = _serialize_result(result, spec.response_schema)
             return success_response(serialized, status_code=spec.status_code)
         except ApiError:
@@ -180,7 +206,7 @@ def _parameter_domains_overlap(first: str, second: str) -> bool:
         return True
     if first == second:
         return True
-    return {first, second}.issubset({"float", "int"})
+    return {first, second}.issubset({"float", "int", "uuid"})
 
 
 def _segments_overlap(first: _PathSegment, second: _PathSegment) -> bool:

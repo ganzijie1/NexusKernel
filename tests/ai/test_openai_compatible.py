@@ -48,6 +48,20 @@ class FakeOpenAI:
         self.closed = True
 
 
+@pytest.mark.parametrize("field", ["timeout_seconds", "tool_timeout_seconds"])
+@pytest.mark.parametrize(
+    "value", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_openai_rejects_non_positive_finite_timeouts(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        OpenAICompatibleClient(
+            api_key="test-secret",  # security-test-fixture
+            model="fake-model",
+            client=FakeOpenAI([]),
+            **{field: value},
+        )
+
+
 def _response(
     content: str | None,
     *,

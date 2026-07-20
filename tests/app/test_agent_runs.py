@@ -264,6 +264,23 @@ def _config(**overrides: Any) -> AgentRunsModuleConfig:
     return AgentRunsModuleConfig.model_validate(values)
 
 
+@pytest.mark.parametrize(
+    "ttl", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_agent_runs_service_rejects_non_positive_finite_session_ttl(
+    ttl: object,
+) -> None:
+    application = AdkApplicationSpec("planner", "v1", "graph", _factory)
+    with pytest.raises(ValueError, match="positive finite"):
+        _service(
+            FakeWorkflowRuntime(()),
+            AdkApplicationRegistry((application,)),
+            _config(),
+            identity_resolver=FixedResolver(),
+            session_ttl_seconds=ttl,  # type: ignore[arg-type]
+        )
+
+
 async def _terminal(service: AppAgentRunsService, run_id: str) -> Any:
     for _ in range(100):
         snapshot = await service.get_run(run_id, _request())

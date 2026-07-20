@@ -10,6 +10,8 @@ from collections.abc import Mapping
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 from prometheus_client.exposition import CONTENT_TYPE_LATEST, generate_latest
 
+from nexus_kernel._validation import require_positive_finite_number
+
 
 _AGENT_RUN_STATUSES = (
     "queued",
@@ -33,8 +35,7 @@ class MetricsRegistry:
     def __init__(self, prefix: str, *, cache_ttl_seconds: float = 5.0) -> None:
         if re.fullmatch(r"[a-z][a-z0-9_]*", prefix) is None:
             raise ValueError("metrics prefix must be a stable lowercase identifier")
-        if cache_ttl_seconds <= 0:
-            raise ValueError("metrics cache TTL must be positive")
+        require_positive_finite_number(cache_ttl_seconds, "metrics cache TTL")
         self._cache_ttl_seconds = cache_ttl_seconds
         self._registry = CollectorRegistry(auto_describe=True)
         self._http_requests = Counter(

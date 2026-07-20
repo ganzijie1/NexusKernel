@@ -7,7 +7,6 @@ import hashlib
 import hmac
 import inspect
 import json
-import math
 import secrets
 import time
 from collections.abc import Awaitable, Callable, Sequence
@@ -39,6 +38,7 @@ from app.services.identity import (
     BearerIdentityResolver,
     TrustedIdentityResolver,
 )
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.ai import (
     AdkApplicationRegistry,
     AdkApplicationSpec,
@@ -287,8 +287,7 @@ class AppAgentRunsService:
         names = [tool.name for tool in tools]
         if len(set(names)) != len(names):
             raise ValueError("Agent tool names must be unique")
-        if session_ttl_seconds <= 0:
-            raise ValueError("session_ttl_seconds must be positive")
+        require_positive_finite_number(session_ttl_seconds, "session_ttl_seconds")
         self._runtime = runtime
         self._registry = registry
         self._config = config
@@ -417,13 +416,7 @@ class AppAgentRunsService:
             if timeout_seconds is None
             else timeout_seconds
         )
-        if (
-            isinstance(timeout, bool)
-            or not isinstance(timeout, int | float)
-            or not math.isfinite(timeout)
-            or timeout <= 0
-        ):
-            raise ValueError("drain timeout must be a positive finite number")
+        require_positive_finite_number(timeout, "drain timeout")
         await self.quiesce()
         if self._drained.is_set():
             return True

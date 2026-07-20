@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from typing import Any
 
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.ai._closing import (
     ActiveCallGate,
     CallAdmissionError,
@@ -57,10 +58,8 @@ class OpenAIStyleClient(ABC):
     ) -> None:
         if not model.strip():
             raise ValueError("model must not be empty")
-        if timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
-        if tool_timeout_seconds <= 0:
-            raise ValueError("tool_timeout_seconds must be positive")
+        require_positive_finite_number(timeout_seconds, "timeout_seconds")
+        require_positive_finite_number(tool_timeout_seconds, "tool_timeout_seconds")
         if max_tool_rounds < 1:
             raise ValueError("max_tool_rounds must be positive")
         if max_tool_calls < 1:

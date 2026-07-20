@@ -13,6 +13,7 @@ from typing import Any
 from jsonschema import ValidationError  # type: ignore[import-untyped]
 from jsonschema.validators import Draft202012Validator  # type: ignore[import-untyped]
 
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.ai.contracts import AgentIdentity, AgentToolSpec, thaw_json
 from nexus_kernel.ai.errors import AiTimeoutError, AiToolError
 
@@ -188,8 +189,7 @@ class ToolExecutor:
         max_argument_bytes: int = 65_536,
         max_result_bytes: int = 65_536,
     ) -> None:
-        if timeout_seconds <= 0:
-            raise ValueError("tool timeout must be positive")
+        require_positive_finite_number(timeout_seconds, "tool timeout")
         if max_calls < 1:
             raise ValueError("max tool calls must be positive")
         if max_argument_bytes < 1:

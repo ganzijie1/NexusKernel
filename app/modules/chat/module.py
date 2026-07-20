@@ -26,17 +26,19 @@ class ChatModuleConfig(ModuleConfig):
     service_bearer_token: SecretStr | None = None
     ai_api_key: SecretStr | None = None
     base_url: str | None = None
-    timeout_seconds: float = Field(default=25.0, gt=0)
-    tool_timeout_seconds: float = Field(default=10.0, gt=0)
+    timeout_seconds: float = Field(default=25.0, gt=0, allow_inf_nan=False)
+    tool_timeout_seconds: float = Field(default=10.0, gt=0, allow_inf_nan=False)
     max_tool_rounds: int = Field(default=4, ge=1, le=16)
     max_tool_calls: int = Field(default=16, ge=1, le=128)
     max_tool_argument_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     max_tool_result_bytes: int = Field(default=65_536, ge=1024, le=1_048_576)
     adk_app_name: str = Field(default="nexus_kernel", pattern=r"^[a-z][a-z0-9_]*$")
-    adk_session_ttl_seconds: float = Field(default=1800.0, gt=0)
+    adk_session_ttl_seconds: float = Field(default=1800.0, gt=0, allow_inf_nan=False)
     adk_session_max_entries: int = Field(default=256, ge=1, le=10_000)
     adk_session_max_events: int = Field(default=200, ge=2, le=2000)
-    adk_session_cleanup_timeout_seconds: float = Field(default=2.0, gt=0, le=30)
+    adk_session_cleanup_timeout_seconds: float = Field(
+        default=2.0, gt=0, le=30, allow_inf_nan=False
+    )
 
     @field_validator("service_bearer_token", "ai_api_key", mode="before")
     @classmethod

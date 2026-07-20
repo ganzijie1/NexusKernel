@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, AsyncContextManager, Protocol
 
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.ai.contracts import SessionKey
 from nexus_kernel.ai.errors import AiProviderError
 
@@ -126,8 +127,7 @@ class BoundedMemoryAdkSessionStore:
         max_events: int = 200,
         time_source: Callable[[], float] = time.monotonic,
     ) -> None:
-        if ttl_seconds <= 0:
-            raise ValueError("session TTL must be positive")
+        require_positive_finite_number(ttl_seconds, "session TTL")
         if max_entries < 1:
             raise ValueError("session capacity must be positive")
         if max_events < 1:

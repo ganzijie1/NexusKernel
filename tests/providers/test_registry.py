@@ -379,6 +379,18 @@ def test_provider_spec_rejects_required_disabled_state() -> None:
         ProviderSpec("required", lambda: object(), required=True, enabled=False)
 
 
+@pytest.mark.parametrize(
+    "timeout", [True, 0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+)
+def test_provider_spec_rejects_non_positive_finite_timeout(timeout: object) -> None:
+    with pytest.raises(ValueError, match="positive finite"):
+        ProviderSpec(
+            "provider",
+            lambda: object(),
+            timeout_seconds=timeout,  # type: ignore[arg-type]
+        )
+
+
 @pytest.mark.asyncio
 async def test_invalid_provider_candidate_is_closed_once() -> None:
     class InvalidProvider:

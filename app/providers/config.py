@@ -39,7 +39,7 @@ class _StrictModel(BaseModel):
 
 class _ProviderConfig(_StrictModel):
     required: bool = False
-    timeout_seconds: float = Field(default=5.0, gt=0)
+    timeout_seconds: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     _schemes: ClassVar[frozenset[str]]
 
     @property

@@ -40,11 +40,11 @@ async def test_run_worker_exits_and_cleans_up_after_delayed_required_failure() -
     task = asyncio.create_task(
         run_worker(cast(ApplicationRuntime, runtime), asyncio.Event())
     )
-    await asyncio.wait_for(runtime.started.wait(), timeout=0.2)
+    await asyncio.wait_for(runtime.started.wait(), timeout=2.0)
 
     runtime.release.set()
     with pytest.raises(WorkerError) as captured:
-        await asyncio.wait_for(task, timeout=0.2)
+        await asyncio.wait_for(task, timeout=2.0)
 
     assert captured.value.errors == ("worker_failed:delayed_failure",)
     assert runtime.stop_calls == 1
