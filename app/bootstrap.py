@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, cast
 
 from fastapi import FastAPI
 
-from app.modules.chat import ChatModule, ChatModuleConfig, create_ai_runtime
 from app.providers import load_provider_settings, register_infrastructure_providers
 from app.routes.chat import create_chat_router
 from app.services.chat import AppChatService, ChatService
@@ -37,6 +36,7 @@ from nexus_kernel.runtime import WorkerState, WorkerStatus, WorkerSupervisor
 
 if TYPE_CHECKING:
     from app.agent_applications import AgentRunsRegistration
+    from app.modules.chat.module import ChatModuleConfig
     from app.services.agent_runs import AgentAuthorizer, AppAgentRunsService
 
 
@@ -298,6 +298,13 @@ def build_runtime(
     )
     settings = load_application_settings(application_path)
     definitions = load_module_definitions(modules_path)
+    agent_runs_definition = definitions.modules.get("agent_runs")
+    if settings.runtime.role == "worker" and agent_runs_definition is not None:
+        modules = dict(definitions.modules)
+        modules["agent_runs"] = agent_runs_definition.model_copy(
+            update={"enabled": False}
+        )
+        definitions = definitions.model_copy(update={"modules": modules})
     provider_settings = load_provider_settings(providers_path)
     metrics = MetricsRegistry(
         settings.monitoring.metrics_prefix,
@@ -311,23 +318,16 @@ def build_runtime(
         (entry.module for entry in loaded_modules if entry.module.name == "agent_runs"),
         None,
     )
-    if settings.runtime.role == "worker":
-        # Agent Runs owns API-process state and has no WorkerSpec in v1. Keeping the
-        # module in a worker Kernel would incorrectly require API credentials and
-        # an application registry that the worker never consumes.
-        loaded_modules = [
-            entry for entry in loaded_modules if entry.module.name != "agent_runs"
-        ]
-        loaded_agent_runs = None
     chat_enabled = loaded_chat is not None
     agent_runs_enabled = loaded_agent_runs is not None
     registry = ProviderRegistry()
     register_infrastructure_providers(registry, provider_settings)
     ai_runtime: Provider | None = None
 
-    if loaded_chat is None:
-        chat_config = ChatModuleConfig()
-    else:
+    chat_config: ChatModuleConfig | None = None
+    if loaded_chat is not None:
+        from app.modules.chat.module import ChatModule, create_ai_runtime
+
         if not isinstance(loaded_chat, ChatModule):
             raise ConfigError("Configured chat module has an invalid type")
         chat_config = loaded_chat.config
@@ -373,12 +373,16 @@ def build_runtime(
             tools=agent_runs_tools,
             identity_resolver=trusted_identity_resolver,
         )
-        from app.modules.agent_runs import AgentRunsModule, AgentRunsModuleConfig
+        from app.modules.agent_runs.module import AgentRunsModule, AgentRunsModuleConfig
         from app.services.agent_runs import AppAgentRunsService
 
         if not isinstance(loaded_agent_runs, AgentRunsModule):
             raise ConfigError("Configured Agent Runs module has an invalid type")
-        if loaded_chat is None or chat_config.provider_id != "google_adk":
+        if (
+            loaded_chat is None
+            or chat_config is None
+            or chat_config.provider_id != "google_adk"
+        ):
             raise ConfigError("Agent Runs requires the google_adk AI provider")
         if (
             ai_runtime is None
@@ -437,7 +441,7 @@ def build_runtime(
     workers = WorkerSupervisor(status_listener=worker_status_listener)
     service_token = (
         chat_config.service_bearer_token.get_secret_value()
-        if chat_config.service_bearer_token is not None
+        if chat_config is not None and chat_config.service_bearer_token is not None
         else None
     )
     chat_service = AppChatService(

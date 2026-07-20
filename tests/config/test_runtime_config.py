@@ -132,7 +132,7 @@ def test_load_application_settings_rejects_container_environment_injection(
         load_application_settings(path)
 
 
-def test_load_module_definitions_preserves_order_alias_and_typed_config(
+def test_load_module_definitions_loads_alias_manifest_and_typed_config(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("FEATURE_ENABLED", "true")
@@ -147,16 +147,21 @@ def test_load_module_definitions_preserves_order_alias_and_typed_config(
     class: tests.fixtures.BetaModule
     enabled: false
     required: false
+    dependencies:
+      - alpha
+    optional_dependencies:
+      - gamma
 """,
     )
 
     settings = load_module_definitions(path)
 
-    assert list(settings.modules) == ["alpha", "beta"]
     assert settings.modules["alpha"].class_path == "tests.fixtures.AlphaModule"
     assert settings.modules["alpha"].config == {"enabled": True}
     assert settings.modules["beta"].enabled is False
     assert settings.modules["beta"].required is False
+    assert settings.modules["beta"].dependencies == ["alpha"]
+    assert settings.modules["beta"].optional_dependencies == ["gamma"]
 
 
 @pytest.mark.parametrize(
@@ -208,4 +213,25 @@ def test_module_names_must_be_non_empty(tmp_path: Path, name: str) -> None:
     )
 
     with pytest.raises(ConfigError):
+        load_module_definitions(path)
+
+
+@pytest.mark.parametrize(
+    "dependency_fields",
+    [
+        "    dependencies: ['', base]\n",
+        "    dependencies: [base, base]\n",
+        "    dependencies: [base]\n    optional_dependencies: [base]\n",
+        "    dependencies: [alpha]\n",
+    ],
+)
+def test_module_dependency_manifest_rejects_invalid_declarations(
+    tmp_path: Path, dependency_fields: str
+) -> None:
+    path = _write(
+        tmp_path / "modules.yaml",
+        f"modules:\n  alpha:\n    class: sample.AlphaModule\n{dependency_fields}",
+    )
+
+    with pytest.raises(ConfigError, match="validation"):
         load_module_definitions(path)

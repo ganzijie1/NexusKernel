@@ -7,15 +7,107 @@ import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 from pydantic import BaseModel, ConfigDict
 
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.errors import ModuleDependencyError
 from nexus_kernel.runtime.workers import WorkerSpec
 
 
 _HTTP_METHOD = re.compile(r"^[A-Z]+$")
+_PROVIDER_NAME = re.compile(r"^[a-z][a-z0-9_]*$")
+_UNBOUND_CONFIG = object()
+
+
+@dataclass(frozen=True, slots=True)
+class _ModuleCapabilities:
+    dependencies: tuple[str, ...]
+    optional_dependencies: tuple[str, ...]
+    required_provider_names: tuple[str, ...]
+    optional_provider_names: tuple[str, ...]
+
+
+def _validate_declaration_tuple(
+    value: object,
+    *,
+    module_name: str,
+    field_name: str,
+    provider_names: bool = False,
+) -> tuple[str, ...]:
+    if not isinstance(value, tuple) or any(
+        not isinstance(name, str)
+        or not name.strip()
+        or name != name.strip()
+        or (provider_names and _PROVIDER_NAME.fullmatch(name) is None)
+        for name in value
+    ):
+        raise ModuleDependencyError(
+            f"Module capability declaration is invalid: {module_name}.{field_name}"
+        )
+    if len(set(value)) != len(value):
+        raise ModuleDependencyError(
+            f"Module capability declaration is duplicated: {module_name}.{field_name}"
+        )
+    return tuple(sorted(value))
+
+
+def _validate_capability_declarations(
+    module_name: str,
+    *,
+    dependencies: object,
+    optional_dependencies: object,
+    required_provider_names: object,
+    optional_provider_names: object,
+) -> _ModuleCapabilities:
+    required_modules = _validate_declaration_tuple(
+        dependencies,
+        module_name=module_name,
+        field_name="dependencies",
+    )
+    optional_modules = _validate_declaration_tuple(
+        optional_dependencies,
+        module_name=module_name,
+        field_name="optional_dependencies",
+    )
+    required_providers = _validate_declaration_tuple(
+        required_provider_names,
+        module_name=module_name,
+        field_name="required_provider_names",
+        provider_names=True,
+    )
+    optional_providers = _validate_declaration_tuple(
+        optional_provider_names,
+        module_name=module_name,
+        field_name="optional_provider_names",
+        provider_names=True,
+    )
+    if (
+        module_name in required_modules
+        or module_name in optional_modules
+        or set(required_modules).intersection(optional_modules)
+        or set(required_providers).intersection(optional_providers)
+    ):
+        raise ModuleDependencyError(
+            f"Module capability declarations are invalid: {module_name}"
+        )
+    return _ModuleCapabilities(
+        dependencies=required_modules,
+        optional_dependencies=optional_modules,
+        required_provider_names=required_providers,
+        optional_provider_names=optional_providers,
+    )
+
+
+def _module_capabilities(module_name: str, source: object) -> _ModuleCapabilities:
+    return _validate_capability_declarations(
+        module_name,
+        dependencies=getattr(source, "dependencies"),
+        optional_dependencies=getattr(source, "optional_dependencies"),
+        required_provider_names=getattr(source, "required_provider_names"),
+        optional_provider_names=getattr(source, "optional_provider_names"),
+    )
 
 
 def _api_descriptor(value: Any) -> tuple[str, Callable[..., Any]] | None:
@@ -49,8 +141,10 @@ class HttpEndpointSpec:
             raise ValueError("endpoint methods must use uppercase HTTP tokens")
         if not self.target_api.strip():
             raise ValueError("endpoint target_api must not be empty")
-        if self.timeout_seconds is not None and self.timeout_seconds <= 0:
-            raise ValueError("endpoint timeout_seconds must be positive")
+        if self.timeout_seconds is not None:
+            require_positive_finite_number(
+                self.timeout_seconds, "endpoint timeout_seconds"
+            )
 
 
 class ModuleState(StrEnum):
@@ -172,17 +266,21 @@ class Module:
     config_schema: type[ModuleConfig] = ModuleConfig
 
     def __init__(self) -> None:
-        self._config = self.config_schema()
+        self._config: ModuleConfig | object = _UNBOUND_CONFIG
         self.state = ModuleState.CREATED
 
     def _set_config(self, config: ModuleConfig) -> None:
         if not isinstance(config, self.config_schema):
             raise TypeError("module configuration does not match its declared schema")
+        if self._config is not _UNBOUND_CONFIG:
+            raise RuntimeError("module configuration is already bound")
         self._config = config
 
     @property
     def config(self) -> ModuleConfig:
-        return self._config
+        if self._config is _UNBOUND_CONFIG:
+            self._config = self.config_schema()
+        return cast(ModuleConfig, self._config)
 
     def on_register(self, context: ModuleContext) -> None:
         """Run after dependency injection; default modules need no registration."""

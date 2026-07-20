@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from typing import Protocol
 
 import pytest
@@ -62,6 +63,36 @@ def test_kernel_rejects_duplicate_worker_names_across_modules() -> None:
 
 
 class RecordingModule(Module):
+    def __new__(
+        cls,
+        name: str | None = None,
+        events: list[str] | None = None,
+        *,
+        dependencies: tuple[str, ...] = (),
+        optional_dependencies: tuple[str, ...] = (),
+        required_provider_names: tuple[str, ...] = (),
+        optional_provider_names: tuple[str, ...] = (),
+        start_error: Exception | None = None,
+        stop_error: Exception | None = None,
+        block_start: bool = False,
+    ) -> RecordingModule:
+        if name is None:
+            return object.__new__(cls)
+        if events is None:
+            raise TypeError("recording events are required")
+        declared_type = type(
+            f"Declared{name.title().replace('-', '')}{cls.__name__}",
+            (cls,),
+            {
+                "name": name,
+                "dependencies": dependencies,
+                "optional_dependencies": optional_dependencies,
+                "required_provider_names": required_provider_names,
+                "optional_provider_names": optional_provider_names,
+            },
+        )
+        return object.__new__(declared_type)
+
     def __init__(
         self,
         name: str,
@@ -69,14 +100,13 @@ class RecordingModule(Module):
         *,
         dependencies: tuple[str, ...] = (),
         optional_dependencies: tuple[str, ...] = (),
+        required_provider_names: tuple[str, ...] = (),
+        optional_provider_names: tuple[str, ...] = (),
         start_error: Exception | None = None,
         stop_error: Exception | None = None,
         block_start: bool = False,
     ) -> None:
         super().__init__()
-        self.name = name
-        self.dependencies = dependencies
-        self.optional_dependencies = optional_dependencies
         self.events = events
         self.start_error = start_error
         self.stop_error = stop_error
@@ -173,8 +203,88 @@ def test_kernel_rejects_missing_and_cyclic_dependencies() -> None:
 
     first = RecordingModule("first", events, dependencies=("second",))
     second = RecordingModule("second", events, dependencies=("first",))
-    with pytest.raises(ModuleDependencyError, match="cycle"):
+    with pytest.raises(ModuleDependencyError, match=r"first -> second -> first"):
         Kernel([_loaded(first, 0), _loaded(second, 1)])
+
+
+def test_kernel_revalidates_loader_dependency_manifest() -> None:
+    class Dependency(Module):
+        name = "dependency"
+
+    class Consumer(Module):
+        name = "consumer"
+        dependencies = ("dependency",)
+
+    dependency = LoadedModule(
+        module=Dependency(),
+        required=True,
+        original_index=1,
+        manifest_dependencies=(),
+        manifest_optional_dependencies=(),
+    )
+    consumer_module = Consumer()
+    consumer = LoadedModule(
+        module=consumer_module,
+        required=True,
+        original_index=0,
+        manifest_dependencies=("dependency",),
+        manifest_optional_dependencies=(),
+    )
+    consumer_module.dependencies = ()
+
+    with pytest.raises(ModuleDependencyError, match="manifest does not match"):
+        Kernel([consumer, dependency])
+
+
+def test_kernel_rejects_class_instance_drift_without_manifest() -> None:
+    class ProgrammaticModule(Module):
+        name = "programmatic"
+        required_provider_names = ("database",)
+
+    module = ProgrammaticModule()
+    module.required_provider_names = ()
+
+    with pytest.raises(ModuleDependencyError, match="class does not match instance"):
+        Kernel([_loaded(module, 0)])
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("dependencies", ["dependency"]),
+        ("dependencies", ("",)),
+        ("dependencies", ("dependency", "dependency")),
+        ("dependencies", ("invalid",)),
+        ("optional_dependencies", ("invalid",)),
+        ("required_provider_names", ["database"]),
+        ("required_provider_names", ("",)),
+        ("required_provider_names", ("Database",)),
+        ("required_provider_names", ("database-name",)),
+        ("required_provider_names", ("database", "database")),
+    ],
+)
+def test_kernel_rejects_invalid_programmatic_capability_declarations(
+    attribute: str,
+    value: object,
+) -> None:
+    declarations: dict[str, object] = {"name": "invalid"}
+    declarations[attribute] = value
+    if attribute == "optional_dependencies" and value == ("invalid",):
+        declarations["dependencies"] = ("invalid",)
+    invalid_type = type("InvalidDeclarations", (Module,), declarations)
+
+    with pytest.raises(ModuleDependencyError, match="declaration"):
+        Kernel([_loaded(invalid_type(), 0)])
+
+
+def test_kernel_rejects_required_optional_provider_overlap() -> None:
+    class InvalidProviders(Module):
+        name = "invalid_providers"
+        required_provider_names = ("database",)
+        optional_provider_names = ("database",)
+
+    with pytest.raises(ModuleDependencyError, match="declarations are invalid"):
+        Kernel([_loaded(InvalidProviders(), 0)])
 
 
 @pytest.mark.asyncio
@@ -191,24 +301,66 @@ async def test_kernel_uses_stable_topology_and_reverse_stop_order() -> None:
         ]
     )
 
-    assert kernel.module_order == ("independent", "base", "feature")
+    assert kernel.module_order == ("base", "feature", "independent")
 
     await kernel.start()
     errors = await kernel.stop()
 
     assert errors == []
     assert events == [
-        "register:independent",
         "register:base",
         "register:feature",
-        "start:independent",
+        "register:independent",
         "start:base",
         "start:feature",
+        "start:independent",
+        "stop:independent",
         "stop:feature",
         "stop:base",
-        "stop:independent",
     ]
     assert all(item["state"] == "stopped" for item in kernel.module_statuses())
+
+
+@pytest.mark.asyncio
+async def test_kernel_lifecycle_order_is_stable_for_chain_and_diamond_permutations() -> (
+    None
+):
+    graphs = (
+        {
+            "alpha": (),
+            "beta": ("alpha",),
+            "gamma": ("beta",),
+        },
+        {
+            "alpha": (),
+            "beta": ("alpha",),
+            "gamma": ("alpha",),
+            "omega": ("beta", "gamma"),
+        },
+    )
+    for graph in graphs:
+        expected_order = tuple(graph)
+        for permutation in itertools.permutations(graph):
+            events: list[str] = []
+            modules = {
+                name: RecordingModule(name, events, dependencies=graph[name])
+                for name in graph
+            }
+            kernel = Kernel(
+                [
+                    _loaded(modules[name], index)
+                    for index, name in enumerate(permutation)
+                ]
+            )
+
+            assert kernel.module_order == expected_order
+            await kernel.start()
+            assert await kernel.stop() == []
+            assert events == [
+                *(f"register:{name}" for name in expected_order),
+                *(f"start:{name}" for name in expected_order),
+                *(f"stop:{name}" for name in reversed(expected_order)),
+            ]
 
 
 @pytest.mark.asyncio
@@ -275,8 +427,14 @@ async def test_repeated_start_cancellation_waits_for_module_cleanup() -> None:
     release_stop = asyncio.Event()
 
     class BlockingCleanupModule(RecordingModule):
+        name = "blocking"
+
         def __init__(self) -> None:
-            super().__init__("blocking", events)
+            Module.__init__(self)
+            self.events = events
+            self.start_error = None
+            self.stop_error = None
+            self.block_start = False
             self.cleaned = False
 
         async def on_start(self, context: ModuleContext) -> None:
@@ -435,8 +593,8 @@ async def test_noncooperative_module_stop_preserves_dependencies_until_retry() -
         "resistant",
         events,
         dependencies=("dependency",),
+        required_provider_names=("shared",),
     )
-    resistant.required_provider_names = ("shared",)
     kernel = Kernel(
         [_loaded(dependency, 0), _loaded(resistant, 1)],
         providers=provider_registry,
@@ -498,8 +656,7 @@ async def test_startup_rollback_preserves_provider_while_module_cleanup_is_pendi
 
     registry = ProviderRegistry()
     registry.register(ProviderSpec("shared", SharedProvider))
-    module = FailedModule("failed", events)
-    module.required_provider_names = ("shared",)
+    module = FailedModule("failed", events, required_provider_names=("shared",))
     kernel = Kernel(
         [_loaded(module, 0)],
         providers=registry,
@@ -576,8 +733,10 @@ class RoutedModule(ContractModule):
 
 @pytest.mark.asyncio
 async def test_degraded_module_api_and_routes_remain_callable() -> None:
-    module = RoutedModule()
-    module.optional_provider_names = ("missing",)
+    class DegradedRoutedModule(RoutedModule):
+        optional_provider_names = ("missing",)
+
+    module = DegradedRoutedModule()
     kernel = Kernel([_loaded(module, 0)])
 
     await kernel.start()
@@ -612,12 +771,81 @@ async def test_missing_optional_module_degrades_consumer_and_accessor_returns_no
 
 
 @pytest.mark.asyncio
+async def test_kernel_uses_frozen_capabilities_after_lifecycle_mutation() -> None:
+    resolved: list[object] = []
+
+    class Dependency(Module):
+        name = "dependency"
+
+    class Consumer(Module):
+        name = "consumer"
+        dependencies = ("dependency",)
+        optional_provider_names = ("missing",)
+
+        def on_register(self, context: ModuleContext) -> None:
+            self.name = "renamed"
+            self.dependencies = ()
+            self.optional_provider_names = ()
+            resolved.append(context.require_module("dependency"))
+
+    dependency = Dependency()
+    consumer = Consumer()
+    kernel = Kernel([_loaded(consumer, 0), _loaded(dependency, 1)])
+
+    assert kernel.module_order == ("dependency", "consumer")
+    await kernel.start()
+
+    assert resolved
+    assert kernel.module_order == ("dependency", "consumer")
+    assert [item["name"] for item in kernel.module_statuses()] == [
+        "dependency",
+        "consumer",
+    ]
+    assert kernel.get_module("consumer")
+    assert consumer.state is ModuleState.DEGRADED
+    assert await kernel.stop() == []
+
+
+@pytest.mark.asyncio
+async def test_kernel_uses_snapshot_name_when_registration_mutates_then_fails() -> None:
+    stopped: list[str] = []
+
+    class Broken(Module):
+        name = "stable"
+
+        def on_register(self, context: ModuleContext) -> None:
+            self.name = "renamed"
+            raise RuntimeError("private registration detail")
+
+        async def on_stop(self, context: ModuleContext) -> None:
+            stopped.append("stable")
+
+    kernel = Kernel([_loaded(Broken(), 0)])
+
+    with pytest.raises(
+        KernelStartupError, match="Required module registration failed: stable"
+    ):
+        await kernel.start()
+
+    assert stopped == ["stable"]
+    assert kernel.module_statuses() == [
+        {
+            "name": "stable",
+            "required": True,
+            "state": "failed",
+            "error": "module_registration_failed",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_degraded_required_dependency_degrades_consumer_without_blocking() -> (
     None
 ):
     events: list[str] = []
-    dependency = RecordingModule("dependency", events)
-    dependency.optional_provider_names = ("missing",)
+    dependency = RecordingModule(
+        "dependency", events, optional_provider_names=("missing",)
+    )
     consumer = RecordingModule("consumer", events, dependencies=("dependency",))
     kernel = Kernel([_loaded(dependency, 0), _loaded(consumer, 1)])
 
@@ -758,17 +986,17 @@ async def test_registration_failure_cleans_all_registered_modules_once_in_revers
             super().on_register(context)
             raise RuntimeError("private registration detail")
 
-    first = RecordingModule("first", events)
+    first = RecordingModule("alpha", events)
     broken = BrokenRegistration("broken", events)
     kernel = Kernel([_loaded(first, 0), _loaded(broken, 1)])
 
     with pytest.raises(KernelStartupError):
         await kernel.start()
     assert events == [
-        "register:first",
+        "register:alpha",
         "register:broken",
         "stop:broken",
-        "stop:first",
+        "stop:alpha",
     ]
     assert broken.state is ModuleState.FAILED
     assert await kernel.stop() == []

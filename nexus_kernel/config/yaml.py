@@ -163,6 +163,6 @@ def load_application_settings(path: str | Path) -> ApplicationSettings:
 
 
 def load_module_definitions(path: str | Path) -> ModulesSettings:
-    """Load and validate ordered module definitions from a YAML file."""
+    """Load and validate dependency-manifest module definitions from YAML."""
 
     return load_config_model(path, ModulesSettings)

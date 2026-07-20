@@ -36,6 +36,8 @@ def test_project_module_class_paths_target_module_files() -> None:
         "app.modules.example.module.ExampleModule"
     )
     assert settings.modules["chat"].class_path == "app.modules.chat.module.ChatModule"
+    assert settings.modules["chat"].dependencies == []
+    assert settings.modules["chat"].optional_dependencies == []
     agent_runs = settings.modules["agent_runs"]
     assert agent_runs.class_path == "app.modules.agent_runs.module.AgentRunsModule"
     assert agent_runs.enabled is False

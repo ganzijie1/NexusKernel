@@ -149,6 +149,44 @@ def test_disabled_chat_module_is_not_exposed_by_application(tmp_path) -> None:
     assert "/api/v1/agents/{agent_id}/runs" not in app.openapi()["paths"]
 
 
+def test_disabled_module_class_is_not_imported_by_bootstrap(tmp_path) -> None:
+    modules = tmp_path / "modules.yaml"
+    modules.write_text(
+        "modules:\n"
+        "  chat:\n"
+        "    class: package_that_does_not_exist.ChatModule\n"
+        "    enabled: false\n",
+        encoding="utf-8",
+    )
+
+    runtime = build_runtime(modules_config=modules)
+
+    assert runtime.chat_enabled is False
+    assert runtime.kernel.module_order == ()
+
+
+def test_worker_filters_agent_runs_before_module_graph_and_import(tmp_path) -> None:
+    application = tmp_path / "application.yaml"
+    application.write_text("runtime:\n  role: worker\n", encoding="utf-8")
+    modules = tmp_path / "modules.yaml"
+    modules.write_text(
+        "modules:\n"
+        "  agent_runs:\n"
+        "    class: package_that_does_not_exist.AgentRunsModule\n"
+        "    enabled: true\n",
+        encoding="utf-8",
+    )
+
+    runtime = build_runtime(
+        application_config=application,
+        modules_config=modules,
+    )
+
+    assert runtime.settings.runtime.role == "worker"
+    assert runtime.agent_runs_enabled is False
+    assert runtime.kernel.module_order == ()
+
+
 def test_agent_runs_rejects_non_adk_provider(tmp_path) -> None:
     modules = _agent_runs_modules_config(tmp_path, provider_id="openai_compatible")
 
@@ -395,7 +433,7 @@ async def test_agent_runs_and_chat_share_one_lazy_runtime_candidate(
     modules = _agent_runs_modules_config(tmp_path)
     provider = _FakeAdkProvider()
     monkeypatch.setattr(
-        "app.bootstrap.create_ai_runtime",
+        "app.modules.chat.module.create_ai_runtime",
         lambda config, *, session_store=None: provider,
     )
 

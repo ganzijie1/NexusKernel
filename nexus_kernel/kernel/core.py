@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import heapq
 import inspect
-import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from functools import wraps
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 
+from nexus_kernel._validation import require_positive_finite_number
 from nexus_kernel.errors import (
     KernelStartupError,
     ModuleAccessError,
@@ -24,6 +25,9 @@ from nexus_kernel.kernel.module import (
     Module,
     ModuleContext,
     ModuleState,
+    _ModuleCapabilities,
+    _module_capabilities,
+    _validate_capability_declarations,
 )
 from nexus_kernel.runtime.workers import WorkerSpec
 
@@ -57,9 +61,13 @@ class ModuleApiProxy:
 
     __slots__ = ("__allowed", "__module_name", "__target")
 
-    def __init__(self, module: Module) -> None:
+    def __init__(self, module: Module, module_name: str | None = None) -> None:
         object.__setattr__(self, "_ModuleApiProxy__target", module)
-        object.__setattr__(self, "_ModuleApiProxy__module_name", module.name)
+        object.__setattr__(
+            self,
+            "_ModuleApiProxy__module_name",
+            module.name if module_name is None else module_name,
+        )
         object.__setattr__(
             self,
             "_ModuleApiProxy__allowed",
@@ -114,28 +122,28 @@ class Kernel:
         *,
         module_cleanup_timeout_seconds: float = 5.0,
     ) -> None:
-        if (
-            not math.isfinite(module_cleanup_timeout_seconds)
-            or module_cleanup_timeout_seconds <= 0
-        ):
-            raise ValueError("module cleanup timeout must be a positive finite value")
+        require_positive_finite_number(
+            module_cleanup_timeout_seconds, "module cleanup timeout"
+        )
         entries = list(modules)
-        self._entries = self._index_entries(entries)
+        self._entries, capabilities = self._index_entries(entries)
+        self._capabilities = MappingProxyType(capabilities)
+        self._entry_names = MappingProxyType(
+            {id(entry): name for name, entry in self._entries.items()}
+        )
         self._ordered = self._resolve_topology(entries)
         if providers is None:
             from nexus_kernel.providers import ProviderRegistry
 
             providers = ProviderRegistry()
         self._providers = providers
-        self._contexts = {
-            entry.module.name: self._create_context(entry.module) for entry in entries
-        }
+        self._contexts = {name: self._create_context(name) for name in self._entries}
         self._worker_specs = self._index_worker_specs()
         self._cleanup_pending: list[LoadedModule] = []
         self._cleanup_tasks: dict[str, _ModuleCleanup] = {}
         self._cleaned: set[str] = set()
         self._module_errors: dict[str, str | None] = {
-            entry.module.name: None for entry in entries
+            name: None for name in self._entries
         }
         self._running = False
         self._stopped = False
@@ -143,70 +151,157 @@ class Kernel:
         self._lifecycle_lock = asyncio.Lock()
 
     @staticmethod
-    def _index_entries(entries: list[LoadedModule]) -> dict[str, LoadedModule]:
+    def _index_entries(
+        entries: list[LoadedModule],
+    ) -> tuple[dict[str, LoadedModule], dict[str, _ModuleCapabilities]]:
         indexed: dict[str, LoadedModule] = {}
+        capabilities: dict[str, _ModuleCapabilities] = {}
         for entry in entries:
-            entry.module.validate_api_implementation()
             name = entry.module.name
+            if not isinstance(name, str) or not name.strip():
+                raise ModuleDependencyError("Module name must not be empty")
             if name in indexed:
                 raise ModuleDependencyError(f"Module name is duplicated: {name}")
+            capabilities[name] = Kernel._validate_entry_capabilities(entry, name)
+            entry.module.validate_api_implementation()
             indexed[name] = entry
-        return indexed
+        return indexed, capabilities
+
+    @staticmethod
+    def _validate_entry_capabilities(
+        entry: LoadedModule, module_name: str
+    ) -> _ModuleCapabilities:
+        module = entry.module
+        class_capabilities = _module_capabilities(module_name, type(module))
+        instance_capabilities = _module_capabilities(module_name, module)
+
+        manifest_required = entry.manifest_dependencies
+        manifest_optional = entry.manifest_optional_dependencies
+        if manifest_required is None and manifest_optional is None:
+            if class_capabilities != instance_capabilities:
+                raise ModuleDependencyError(
+                    f"Module capability class does not match instance: {module_name}"
+                )
+            return instance_capabilities
+        if manifest_required is None or manifest_optional is None:
+            raise ModuleDependencyError(
+                f"Module dependency manifest is incomplete: {module_name}"
+            )
+        configured = _validate_capability_declarations(
+            module_name,
+            dependencies=manifest_required,
+            optional_dependencies=manifest_optional,
+            required_provider_names=(),
+            optional_provider_names=(),
+        )
+        if (
+            class_capabilities.dependencies != configured.dependencies
+            or instance_capabilities.dependencies != configured.dependencies
+            or class_capabilities.optional_dependencies
+            != configured.optional_dependencies
+            or instance_capabilities.optional_dependencies
+            != configured.optional_dependencies
+        ):
+            raise ModuleDependencyError(
+                f"Module dependency manifest does not match: {module_name}"
+            )
+        if (
+            class_capabilities.required_provider_names
+            != instance_capabilities.required_provider_names
+            or class_capabilities.optional_provider_names
+            != instance_capabilities.optional_provider_names
+        ):
+            raise ModuleDependencyError(
+                f"Module capability class does not match instance: {module_name}"
+            )
+        return instance_capabilities
+
+    def _entry_name(self, entry: LoadedModule) -> str:
+        return self._entry_names[id(entry)]
+
+    @staticmethod
+    def _dependency_cycle_path(
+        dependencies: dict[str, set[str]],
+    ) -> tuple[str, ...]:
+        visiting: set[str] = set()
+        visited: set[str] = set()
+        stack: list[str] = []
+        positions: dict[str, int] = {}
+
+        def visit(name: str) -> tuple[str, ...] | None:
+            visiting.add(name)
+            positions[name] = len(stack)
+            stack.append(name)
+            for dependency in sorted(dependencies[name]):
+                if dependency in visiting:
+                    return (*stack[positions[dependency] :], dependency)
+                if dependency not in visited:
+                    found = visit(dependency)
+                    if found is not None:
+                        return found
+            stack.pop()
+            positions.pop(name)
+            visiting.remove(name)
+            visited.add(name)
+            return None
+
+        for name in sorted(dependencies):
+            if name not in visited:
+                found = visit(name)
+                if found is not None:
+                    return found
+        return ()
 
     def _resolve_topology(self, entries: list[LoadedModule]) -> list[LoadedModule]:
         by_name = self._entries
         indegree = {name: 0 for name in by_name}
         dependents: dict[str, set[str]] = {name: set() for name in by_name}
+        present_by_name: dict[str, set[str]] = {name: set() for name in by_name}
 
         for entry in entries:
-            module = entry.module
-            for dependency in module.dependencies:
+            module_name = self._entry_name(entry)
+            capabilities = self._capabilities[module_name]
+            for dependency in capabilities.dependencies:
                 if dependency not in by_name:
                     raise ModuleDependencyError(
                         f"Required module dependency is missing: {dependency}"
                     )
-            present_dependencies = set(module.dependencies)
+            present_dependencies = set(capabilities.dependencies)
             present_dependencies.update(
-                name for name in module.optional_dependencies if name in by_name
+                name for name in capabilities.optional_dependencies if name in by_name
             )
+            present_by_name[module_name] = present_dependencies
             for dependency in present_dependencies:
-                if module.name not in dependents[dependency]:
-                    dependents[dependency].add(module.name)
-                    indegree[module.name] += 1
+                if module_name not in dependents[dependency]:
+                    dependents[dependency].add(module_name)
+                    indegree[module_name] += 1
 
-        ready = [
-            (entry.original_index, entry.module.name)
-            for entry in entries
-            if indegree[entry.module.name] == 0
-        ]
+        ready = [name for name, count in indegree.items() if count == 0]
         heapq.heapify(ready)
         ordered: list[LoadedModule] = []
         while ready:
-            _, name = heapq.heappop(ready)
+            name = heapq.heappop(ready)
             ordered.append(by_name[name])
-            for dependent in sorted(
-                dependents[name], key=lambda item: by_name[item].original_index
-            ):
+            for dependent in sorted(dependents[name]):
                 indegree[dependent] -= 1
                 if indegree[dependent] == 0:
-                    heapq.heappush(
-                        ready, (by_name[dependent].original_index, dependent)
-                    )
+                    heapq.heappush(ready, dependent)
 
         if len(ordered) != len(entries):
-            cyclic = sorted(name for name, count in indegree.items() if count > 0)
+            cycle = self._dependency_cycle_path(present_by_name)
             raise ModuleDependencyError(
-                f"Module dependency cycle detected: {', '.join(cyclic)}"
+                f"Module dependency cycle detected: {' -> '.join(cycle)}"
             )
         return ordered
 
-    def _create_context(self, module: Module) -> ModuleContext:
+    def _create_context(self, module_name: str) -> ModuleContext:
+        capabilities = self._capabilities[module_name]
         return ModuleContext._create(
-            module_name=module.name,
-            required_modules=module.dependencies,
-            optional_modules=module.optional_dependencies,
-            required_providers=module.required_provider_names,
-            optional_providers=module.optional_provider_names,
+            module_name=module_name,
+            required_modules=capabilities.dependencies,
+            optional_modules=capabilities.optional_dependencies,
+            required_providers=capabilities.required_provider_names,
+            optional_providers=capabilities.optional_provider_names,
             module_resolver=self._require_resolvable_module,
             optional_module_resolver=self._optional_resolvable_module,
             provider_resolver=self._providers.require,
@@ -217,30 +312,31 @@ class Kernel:
         indexed: dict[str, tuple[WorkerSpec, ...]] = {}
         owners: dict[str, str] = {}
         for entry in self._ordered:
+            module_name = self._entry_name(entry)
             try:
                 specs = tuple(entry.module.get_worker_specs())
             except Exception:
                 raise WorkerError(
-                    f"Unable to load Worker specs for module: {entry.module.name}"
+                    f"Unable to load Worker specs for module: {module_name}"
                 ) from None
             for spec in specs:
                 if not isinstance(spec, WorkerSpec):
                     raise WorkerError(
-                        f"Module returned an invalid Worker spec: {entry.module.name}"
+                        f"Module returned an invalid Worker spec: {module_name}"
                     )
                 previous_owner = owners.get(spec.name)
                 if previous_owner is not None:
                     raise WorkerError(
                         "Worker name is duplicated across modules: "
-                        f"{spec.name} ({previous_owner}, {entry.module.name})"
+                        f"{spec.name} ({previous_owner}, {module_name})"
                     )
-                owners[spec.name] = entry.module.name
-            indexed[entry.module.name] = specs
+                owners[spec.name] = module_name
+            indexed[module_name] = specs
         return indexed
 
     @property
     def module_order(self) -> tuple[str, ...]:
-        return tuple(entry.module.name for entry in self._ordered)
+        return tuple(self._entry_name(entry) for entry in self._ordered)
 
     @property
     def providers(self) -> ProviderRegistry:
@@ -257,7 +353,7 @@ class Kernel:
             module = self._entries[name].module
         except KeyError:
             raise ModuleLookupError(f"Module is not registered: {name}") from None
-        return ModuleApiProxy(module)
+        return ModuleApiProxy(module, name)
 
     def _require_resolvable_module(self, name: str) -> ModuleApiProxy:
         proxy = self.get_module(name)
@@ -269,25 +365,24 @@ class Kernel:
         entry = self._entries.get(name)
         if entry is None or entry.module.state not in _RESOLVABLE_STATES:
             return None
-        return ModuleApiProxy(entry.module)
+        return ModuleApiProxy(entry.module, name)
 
     def route_bindings(self) -> list[ModuleRouteBinding]:
         """Return declared endpoint specs paired with state-guarded handlers."""
 
         bindings: list[ModuleRouteBinding] = []
         for entry in self._ordered:
-            proxy = self.get_module(entry.module.name)
+            module_name = self._entry_name(entry)
+            proxy = self.get_module(module_name)
             for endpoint in entry.module.get_http_endpoints():
                 try:
                     handler = getattr(proxy, endpoint.target_api)
                 except ModuleAccessError:
                     raise ModuleDependencyError(
                         "HTTP endpoint target is outside its module API contract: "
-                        f"{entry.module.name}.{endpoint.target_api}"
+                        f"{module_name}.{endpoint.target_api}"
                     ) from None
-                bindings.append(
-                    ModuleRouteBinding(entry.module.name, endpoint, handler)
-                )
+                bindings.append(ModuleRouteBinding(module_name, endpoint, handler))
         return bindings
 
     def worker_specs(self) -> list[WorkerSpec]:
@@ -295,7 +390,7 @@ class Kernel:
             spec
             for entry in self._ordered
             if entry.module.state in _OPERATIONAL_STATES
-            for spec in self._worker_specs[entry.module.name]
+            for spec in self._worker_specs[self._entry_name(entry)]
         ]
 
     async def start(self) -> None:
@@ -333,32 +428,35 @@ class Kernel:
     async def _register_modules(self) -> None:
         for entry in self._ordered:
             module = entry.module
+            module_name = self._entry_name(entry)
             self._cleanup_pending.append(entry)
             try:
-                module.on_register(self._contexts[module.name])
+                module.on_register(self._contexts[module_name])
             except asyncio.CancelledError:
                 module.state = ModuleState.FAILED
-                self._module_errors[module.name] = "module_registration_cancelled"
+                self._module_errors[module_name] = "module_registration_cancelled"
                 raise
             except Exception:
                 module.state = ModuleState.FAILED
-                self._module_errors[module.name] = "module_registration_failed"
+                self._module_errors[module_name] = "module_registration_failed"
                 _, cleanup_cancellation, _ = await self._cleanup_module(entry)
                 if cleanup_cancellation is not None:
                     raise cleanup_cancellation
                 if entry.required:
                     raise KernelStartupError(
-                        f"Required module registration failed: {module.name}"
+                        f"Required module registration failed: {module_name}"
                     ) from None
             else:
                 module.state = ModuleState.REGISTERED
 
     async def _start_module(self, entry: LoadedModule) -> None:
         module = entry.module
+        module_name = self._entry_name(entry)
+        capabilities = self._capabilities[module_name]
         unavailable_dependency = next(
             (
                 name
-                for name in module.dependencies
+                for name in capabilities.dependencies
                 if self._entries[name].module.state not in _OPERATIONAL_STATES
             ),
             None,
@@ -369,26 +467,26 @@ class Kernel:
 
         degraded = any(
             self._entries[name].module.state is ModuleState.DEGRADED
-            for name in module.dependencies
+            for name in capabilities.dependencies
         ) or any(
             name not in self._entries
             or self._entries[name].module.state is not ModuleState.READY
-            for name in module.optional_dependencies
+            for name in capabilities.optional_dependencies
         )
 
         try:
-            for provider_name in module.required_provider_names:
+            for provider_name in capabilities.required_provider_names:
                 self._providers.require(provider_name)
             optional_provider_missing = any(
                 self._providers.get(name) is None
-                for name in module.optional_provider_names
+                for name in capabilities.optional_provider_names
             )
             degraded = degraded or optional_provider_missing
             module.state = ModuleState.STARTING
-            await module.on_start(self._contexts[module.name])
+            await module.on_start(self._contexts[module_name])
         except asyncio.CancelledError as cancellation:
             module.state = ModuleState.FAILED
-            self._module_errors[module.name] = "module_start_cancelled"
+            self._module_errors[module_name] = "module_start_cancelled"
             await self._cleanup_module(entry)
             raise cancellation
         except Exception:
@@ -396,20 +494,21 @@ class Kernel:
             return
 
         module.state = ModuleState.DEGRADED if degraded else ModuleState.READY
-        self._module_errors[module.name] = (
+        self._module_errors[module_name] = (
             "optional_capability_unavailable" if degraded else None
         )
 
     async def _module_failed(self, entry: LoadedModule, error_code: str) -> None:
         module = entry.module
+        module_name = self._entry_name(entry)
         module.state = ModuleState.FAILED
-        self._module_errors[module.name] = error_code
+        self._module_errors[module_name] = error_code
         _, cleanup_cancellation, _ = await self._cleanup_module(entry)
         if cleanup_cancellation is not None:
             raise cleanup_cancellation
         if entry.required:
             raise KernelStartupError(
-                f"Required module failed to start: {module.name}"
+                f"Required module failed to start: {module_name}"
             ) from None
 
     async def _wait_for_module_cleanup(
@@ -464,44 +563,45 @@ class Kernel:
         allow_retry: bool = True,
     ) -> tuple[str | None, asyncio.CancelledError | None, bool]:
         module = entry.module
-        if module.name in self._cleaned:
+        module_name = self._entry_name(entry)
+        if module_name in self._cleaned:
             return None, None, False
-        cleanup = self._cleanup_tasks.get(module.name)
+        cleanup = self._cleanup_tasks.get(module_name)
         if cleanup is None:
             task = asyncio.create_task(
-                module.on_stop(self._contexts[module.name]),
-                name=f"nexus_kernel_module_cleanup_{module.name}",
+                module.on_stop(self._contexts[module_name]),
+                name=f"nexus_kernel_module_cleanup_{module_name}",
             )
             task.add_done_callback(self._consume_module_cleanup_result)
             cleanup = _ModuleCleanup(
                 task=task,
                 prior_state=module.state,
-                prior_error=self._module_errors[module.name],
+                prior_error=self._module_errors[module_name],
             )
-            self._cleanup_tasks[module.name] = cleanup
+            self._cleanup_tasks[module_name] = cleanup
         terminal, succeeded, cancellation = await self._wait_for_module_cleanup(
             cleanup,
             allow_retry=allow_retry,
         )
         if not terminal:
             module.state = ModuleState.FAILED
-            self._module_errors[module.name] = "module_stop_timeout"
-            return f"module_stop_timeout:{module.name}", cancellation, True
+            self._module_errors[module_name] = "module_stop_timeout"
+            return f"module_stop_timeout:{module_name}", cancellation, True
 
-        self._cleaned.add(module.name)
+        self._cleaned.add(module_name)
         if not succeeded:
             module.state = ModuleState.FAILED
             if cleanup.prior_state is ModuleState.FAILED:
-                self._module_errors[module.name] = cleanup.prior_error
+                self._module_errors[module_name] = cleanup.prior_error
             else:
-                self._module_errors[module.name] = "module_stop_failed"
-            return f"module_stop_failed:{module.name}", cancellation, False
+                self._module_errors[module_name] = "module_stop_failed"
+            return f"module_stop_failed:{module_name}", cancellation, False
         if cleanup.prior_state is not ModuleState.FAILED:
             module.state = ModuleState.STOPPED
-            self._module_errors[module.name] = None
+            self._module_errors[module_name] = None
         else:
             module.state = ModuleState.FAILED
-            self._module_errors[module.name] = cleanup.prior_error
+            self._module_errors[module_name] = cleanup.prior_error
         return None, cancellation, False
 
     async def _rollback_startup(self) -> asyncio.CancelledError | None:
@@ -566,10 +666,10 @@ class Kernel:
     def module_statuses(self) -> list[dict[str, Any]]:
         return [
             {
-                "name": entry.module.name,
+                "name": self._entry_name(entry),
                 "required": entry.required,
                 "state": entry.module.state.value,
-                "error": self._module_errors[entry.module.name],
+                "error": self._module_errors[self._entry_name(entry)],
             }
             for entry in self._ordered
         ]

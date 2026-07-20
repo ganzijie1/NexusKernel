@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import itertools
+import os
+import subprocess
 import sys
 import traceback
+from pathlib import Path
 from types import ModuleType
 from typing import Any, Protocol
 
 import pytest
-from pydantic import ValidationError
+from pydantic import ConfigDict, ValidationError
 
 from nexus_kernel.config import ModulesSettings
 from nexus_kernel.errors import ConfigError, ModuleDependencyError
@@ -24,9 +28,27 @@ class GoodModuleConfig(ModuleConfig):
     limit: int = 4
 
 
+class RequiredModuleConfig(ModuleConfig):
+    label: str
+
+
 class GoodModule(Module):
     name = "good"
     config_schema = GoodModuleConfig
+
+
+class RequiredConfigModule(Module):
+    name = "required_config"
+    config_schema = RequiredModuleConfig
+
+
+class NonStrictModuleConfig(ModuleConfig):
+    model_config = ConfigDict(extra="allow", strict=False, frozen=False)
+
+
+class NonStrictConfigModule(Module):
+    name = "non_strict_config"
+    config_schema = NonStrictModuleConfig
 
 
 class OtherNameModule(Module):
@@ -49,21 +71,95 @@ class MissingApiModule(Module):
     api_contract = MissingApi
 
 
+_LOAD_EVENTS: list[str] = []
+
+
+class AlphaModule(Module):
+    name = "alpha"
+
+    def __init__(self) -> None:
+        super().__init__()
+        _LOAD_EVENTS.append("construct:alpha")
+
+
+class BetaModule(Module):
+    name = "beta"
+    dependencies = ("alpha",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        _LOAD_EVENTS.append("construct:beta")
+
+
+class GammaModule(Module):
+    name = "gamma"
+    optional_dependencies = ("beta",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        _LOAD_EVENTS.append("construct:gamma")
+
+
+class ReadsConfigDuringConstruction(Module):
+    name = "reads_config"
+    config_schema = GoodModuleConfig
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.observed_limit = self.config.limit
+
+
+class MutatesDependenciesDuringConstruction(Module):
+    name = "mutates_dependencies"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dependencies = ("unexpected",)
+
+
+class MutatesProvidersDuringConstruction(Module):
+    name = "mutates_providers"
+    required_provider_names = ("database",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.required_provider_names = ()
+        self.optional_provider_names = ("database",)
+
+
 def _plugin_module() -> ModuleType:
     plugin = ModuleType("test_module_plugin")
     plugin.GoodModule = GoodModule
+    plugin.RequiredConfigModule = RequiredConfigModule
+    plugin.NonStrictConfigModule = NonStrictConfigModule
     plugin.OtherNameModule = OtherNameModule
     plugin.BrokenConstructorModule = BrokenConstructorModule
     plugin.MissingApiModule = MissingApiModule
+    plugin.ReadsConfigDuringConstruction = ReadsConfigDuringConstruction
+    plugin.MutatesDependenciesDuringConstruction = MutatesDependenciesDuringConstruction
+    plugin.MutatesProvidersDuringConstruction = MutatesProvidersDuringConstruction
     plugin.NotAModule = object
     return plugin
+
+
+def _dependency_plugin_modules() -> dict[str, ModuleType]:
+    plugins: dict[str, ModuleType] = {}
+    for name, module_type in (
+        ("alpha", AlphaModule),
+        ("beta", BetaModule),
+        ("gamma", GammaModule),
+    ):
+        plugin = ModuleType(f"test_{name}_plugin")
+        setattr(plugin, module_type.__name__, module_type)
+        plugins[plugin.__name__] = plugin
+    return plugins
 
 
 def _settings(modules: dict[str, object]) -> ModulesSettings:
     return ModulesSettings.model_validate({"modules": modules})
 
 
-def test_loader_skips_disabled_modules_and_preserves_declaration_order(
+def test_loader_skips_disabled_modules_and_preserves_original_index_for_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
@@ -89,6 +185,409 @@ def test_loader_skips_disabled_modules_and_preserves_declaration_order(
     assert loaded[0].module.state is ModuleState.CREATED
     assert loaded[0].module.config.limit == 4
     assert isinstance(loaded[0].module.config, GoodModuleConfig)
+
+
+def test_loader_uses_dependency_first_order_for_every_manifest_permutation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins = _dependency_plugin_modules()
+    for name, plugin in plugins.items():
+        monkeypatch.setitem(sys.modules, name, plugin)
+    real_import_module = __import__("importlib").import_module
+
+    definitions = {
+        "alpha": {"class": "test_alpha_plugin.AlphaModule"},
+        "beta": {
+            "class": "test_beta_plugin.BetaModule",
+            "dependencies": ["alpha"],
+        },
+        "gamma": {
+            "class": "test_gamma_plugin.GammaModule",
+            "optional_dependencies": ["beta"],
+        },
+    }
+
+    for names in itertools.permutations(definitions):
+        imported: list[str] = []
+        _LOAD_EVENTS.clear()
+
+        def recording_import(name: str, package: str | None = None) -> ModuleType:
+            if name.startswith("test_"):
+                imported.append(name)
+            return real_import_module(name, package)
+
+        monkeypatch.setattr(
+            "nexus_kernel.kernel.loader.importlib.import_module", recording_import
+        )
+        settings = _settings({name: definitions[name] for name in names})
+
+        loaded = load_modules(settings)
+
+        assert [item.module.name for item in loaded] == ["alpha", "beta", "gamma"]
+        assert imported == [
+            "test_alpha_plugin",
+            "test_beta_plugin",
+            "test_gamma_plugin",
+        ]
+        assert _LOAD_EVENTS == [
+            "construct:alpha",
+            "construct:beta",
+            "construct:gamma",
+        ]
+
+
+def test_loader_rejects_graph_errors_before_importing_any_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_import(name: str, package: str | None = None) -> ModuleType:
+        raise AssertionError(f"implementation imported unexpectedly: {name}")
+
+    monkeypatch.setattr(
+        "nexus_kernel.kernel.loader.importlib.import_module", unexpected_import
+    )
+
+    with pytest.raises(ConfigError, match="missing or disabled"):
+        load_modules(
+            _settings(
+                {
+                    "consumer": {
+                        "class": "invalid.consumer.Consumer",
+                        "dependencies": ["dependency"],
+                    },
+                    "dependency": {
+                        "class": "invalid.dependency.Dependency",
+                        "enabled": False,
+                    },
+                }
+            )
+        )
+
+    with pytest.raises(ConfigError, match=r"alpha -> beta -> alpha"):
+        load_modules(
+            _settings(
+                {
+                    "beta": {
+                        "class": "invalid.beta.Beta",
+                        "dependencies": ["alpha"],
+                    },
+                    "alpha": {
+                        "class": "invalid.alpha.Alpha",
+                        "dependencies": ["beta"],
+                    },
+                }
+            )
+        )
+
+
+def test_loader_ignores_missing_or_disabled_optional_dependency_implementation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins = _dependency_plugin_modules()
+    for name, plugin in plugins.items():
+        monkeypatch.setitem(sys.modules, name, plugin)
+    real_import_module = __import__("importlib").import_module
+    imported: list[str] = []
+    _LOAD_EVENTS.clear()
+
+    def recording_import(name: str, package: str | None = None) -> ModuleType:
+        if name.startswith("test_"):
+            imported.append(name)
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(
+        "nexus_kernel.kernel.loader.importlib.import_module", recording_import
+    )
+
+    loaded = load_modules(
+        _settings(
+            {
+                "gamma": {
+                    "class": "test_gamma_plugin.GammaModule",
+                    "optional_dependencies": ["beta"],
+                },
+                "beta": {
+                    "class": "package_that_does_not_exist.BetaModule",
+                    "enabled": False,
+                },
+            }
+        )
+    )
+
+    assert [entry.module.name for entry in loaded] == ["gamma"]
+    assert imported == ["test_gamma_plugin"]
+    assert _LOAD_EVENTS == ["construct:gamma"]
+
+
+def test_loader_does_not_import_consumer_when_dependency_config_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins = _dependency_plugin_modules()
+    for name, plugin in plugins.items():
+        monkeypatch.setitem(sys.modules, name, plugin)
+    real_import_module = __import__("importlib").import_module
+    imported: list[str] = []
+    _LOAD_EVENTS.clear()
+
+    def recording_import(name: str, package: str | None = None) -> ModuleType:
+        if name.startswith("test_"):
+            imported.append(name)
+        return real_import_module(name, package)
+
+    monkeypatch.setattr(
+        "nexus_kernel.kernel.loader.importlib.import_module", recording_import
+    )
+
+    with pytest.raises(ConfigError, match="alpha"):
+        load_modules(
+            _settings(
+                {
+                    "beta": {
+                        "class": "test_beta_plugin.BetaModule",
+                        "dependencies": ["alpha"],
+                    },
+                    "alpha": {
+                        "class": "test_alpha_plugin.AlphaModule",
+                        "config": {"not_allowed": True},
+                    },
+                }
+            )
+        )
+
+    assert imported == ["test_alpha_plugin"]
+    assert _LOAD_EVENTS == []
+
+
+def test_loader_validates_every_config_before_constructing_instances(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    plugins = _dependency_plugin_modules()
+    for name, plugin in plugins.items():
+        monkeypatch.setitem(sys.modules, name, plugin)
+    _LOAD_EVENTS.clear()
+
+    with pytest.raises(ConfigError, match="gamma"):
+        load_modules(
+            _settings(
+                {
+                    "alpha": {"class": "test_alpha_plugin.AlphaModule"},
+                    "gamma": {
+                        "class": "test_gamma_plugin.GammaModule",
+                        "optional_dependencies": ["beta"],
+                        "config": {"not_allowed": True},
+                    },
+                }
+            )
+        )
+
+    assert _LOAD_EVENTS == []
+
+
+def test_loader_rejects_manifest_drift_and_constructor_config_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
+
+    with pytest.raises(ConfigError, match="mutates_dependencies"):
+        load_modules(
+            _settings(
+                {
+                    "mutates_dependencies": {
+                        "class": (
+                            "test_module_plugin.MutatesDependenciesDuringConstruction"
+                        )
+                    }
+                }
+            )
+        )
+
+    with pytest.raises(ConfigError, match="reads_config"):
+        load_modules(
+            _settings(
+                {
+                    "reads_config": {
+                        "class": "test_module_plugin.ReadsConfigDuringConstruction",
+                        "config": {"limit": 8},
+                    }
+                }
+            )
+        )
+
+    with pytest.raises(ConfigError, match="mutates_providers"):
+        load_modules(
+            _settings(
+                {
+                    "mutates_providers": {
+                        "class": "test_module_plugin.MutatesProvidersDuringConstruction"
+                    }
+                }
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("attribute", "value"),
+    [
+        ("dependencies", ["dependency"]),
+        ("dependencies", ("",)),
+        ("dependencies", ("dependency", "dependency")),
+        ("required_provider_names", ["database"]),
+        ("required_provider_names", ("",)),
+        ("required_provider_names", ("Database",)),
+        ("required_provider_names", ("database-name",)),
+        ("required_provider_names", ("database", "database")),
+    ],
+)
+def test_loader_rejects_invalid_class_capability_declarations(
+    monkeypatch: pytest.MonkeyPatch,
+    attribute: str,
+    value: object,
+) -> None:
+    invalid_type = type(
+        "InvalidDeclarations",
+        (Module,),
+        {"name": "invalid_declarations", attribute: value},
+    )
+    plugin = ModuleType("invalid_declarations_plugin")
+    plugin.InvalidDeclarations = invalid_type
+    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
+
+    with pytest.raises(ConfigError, match="invalid_declarations"):
+        load_modules(
+            _settings(
+                {
+                    "invalid_declarations": {
+                        "class": ("invalid_declarations_plugin.InvalidDeclarations")
+                    }
+                }
+            )
+        )
+
+
+def test_loader_rejects_required_optional_provider_overlap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class InvalidProviders(Module):
+        name = "invalid_providers"
+        required_provider_names = ("database",)
+        optional_provider_names = ("database",)
+
+    plugin = ModuleType("invalid_providers_plugin")
+    plugin.InvalidProviders = InvalidProviders
+    monkeypatch.setitem(sys.modules, plugin.__name__, plugin)
+
+    with pytest.raises(ConfigError, match="invalid_providers"):
+        load_modules(
+            _settings(
+                {
+                    "invalid_providers": {
+                        "class": "invalid_providers_plugin.InvalidProviders"
+                    }
+                }
+            )
+        )
+
+
+def test_module_direct_construction_lazily_binds_default_config_once() -> None:
+    module = GoodModule()
+
+    assert module.config.limit == 4
+    with pytest.raises(RuntimeError, match="already bound"):
+        module._set_config(GoodModuleConfig(limit=8))
+
+
+@pytest.mark.parametrize(
+    "graph",
+    [
+        {
+            "alpha": (),
+            "beta": ("alpha",),
+            "gamma": ("beta",),
+        },
+        {
+            "alpha": (),
+            "beta": ("alpha",),
+            "gamma": ("alpha",),
+            "omega": ("beta", "gamma"),
+        },
+    ],
+    ids=("three-module-chain", "four-module-diamond"),
+)
+def test_real_plugin_lifecycle_is_dependency_first_for_every_manifest_permutation(
+    tmp_path: Path,
+    graph: dict[str, tuple[str, ...]],
+) -> None:
+    expected_order = tuple(graph)
+    for name, dependencies in graph.items():
+        (tmp_path / f"plugin_{name}.py").write_text(
+            "import os\n"
+            "from pathlib import Path\n"
+            "from nexus_kernel.kernel import Module, ModuleContext\n"
+            "def record(event):\n"
+            "    with Path(os.environ['MODULE_EVENTS']).open('a', encoding='utf-8') as stream:\n"
+            "        stream.write(event + '\\n')\n"
+            f"record('import:{name}')\n"
+            "class PluginModule(Module):\n"
+            f"    name = {name!r}\n"
+            f"    dependencies = {dependencies!r}\n"
+            "    def __init__(self):\n"
+            "        super().__init__()\n"
+            f"        record('construct:{name}')\n"
+            "    def on_register(self, context: ModuleContext):\n"
+            f"        record('register:{name}')\n"
+            "    async def on_start(self, context: ModuleContext):\n"
+            f"        record('start:{name}')\n"
+            "    async def on_stop(self, context: ModuleContext):\n"
+            f"        record('stop:{name}')\n",
+            encoding="utf-8",
+        )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (str(tmp_path), str(Path(__file__).resolve().parents[2]))
+    )
+    expected_events = [
+        *(f"import:{name}" for name in expected_order),
+        *(f"construct:{name}" for name in expected_order),
+        *(f"register:{name}" for name in expected_order),
+        *(f"start:{name}" for name in expected_order),
+        *(f"stop:{name}" for name in reversed(expected_order)),
+    ]
+
+    for index, permutation in enumerate(itertools.permutations(graph)):
+        event_path = tmp_path / f"events-{index}.txt"
+        environment["MODULE_EVENTS"] = str(event_path)
+        definitions = {
+            name: {
+                "class": f"plugin_{name}.PluginModule",
+                "dependencies": list(graph[name]),
+            }
+            for name in permutation
+        }
+        script = (
+            "import asyncio\n"
+            "from nexus_kernel.config import ModulesSettings\n"
+            "from nexus_kernel.kernel import Kernel, load_modules\n"
+            f"definitions = {definitions!r}\n"
+            f"expected_order = {expected_order!r}\n"
+            "async def main():\n"
+            "    loaded = load_modules(ModulesSettings.model_validate("
+            "{'modules': definitions}))\n"
+            "    kernel = Kernel(loaded)\n"
+            "    assert kernel.module_order == expected_order\n"
+            "    await kernel.start()\n"
+            "    assert await kernel.stop() == []\n"
+            "asyncio.run(main())\n"
+        )
+
+        subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=Path(__file__).resolve().parents[2],
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert event_path.read_text(encoding="utf-8").splitlines() == expected_events
 
 
 def test_module_config_is_strict_frozen_and_rejects_unknown_fields(
@@ -129,6 +628,43 @@ def test_module_config_is_strict_frozen_and_rejects_unknown_fields(
                     "good": {
                         "class": "test_module_plugin.GoodModule",
                         "config": {"unknown": True},
+                    }
+                }
+            )
+        )
+
+
+def test_loader_validates_required_config_before_constructing_module(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
+
+    module = load_modules(
+        _settings(
+            {
+                "required_config": {
+                    "class": "test_module_plugin.RequiredConfigModule",
+                    "config": {"label": "configured"},
+                }
+            }
+        )
+    )[0].module
+
+    assert isinstance(module.config, RequiredModuleConfig)
+    assert module.config.label == "configured"
+
+
+def test_loader_rejects_module_config_schema_that_weakens_base_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(sys.modules, "test_module_plugin", _plugin_module())
+
+    with pytest.raises(ConfigError, match="non_strict_config"):
+        load_modules(
+            _settings(
+                {
+                    "non_strict_config": {
+                        "class": "test_module_plugin.NonStrictConfigModule"
                     }
                 }
             )
@@ -581,6 +1117,30 @@ def test_http_endpoint_spec_normalizes_valid_methods() -> None:
             "methods": ("GET",),
             "target_api": "list_items",
             "timeout_seconds": 0,
+        },
+        {
+            "path": "/items",
+            "methods": ("GET",),
+            "target_api": "list_items",
+            "timeout_seconds": True,
+        },
+        {
+            "path": "/items",
+            "methods": ("GET",),
+            "target_api": "list_items",
+            "timeout_seconds": float("nan"),
+        },
+        {
+            "path": "/items",
+            "methods": ("GET",),
+            "target_api": "list_items",
+            "timeout_seconds": float("inf"),
+        },
+        {
+            "path": "/items",
+            "methods": ("GET",),
+            "target_api": "list_items",
+            "timeout_seconds": -float("inf"),
         },
     ],
 )
