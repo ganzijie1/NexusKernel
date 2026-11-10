@@ -23,6 +23,32 @@ def _bash() -> str:
     pytest.skip("Bash is required for the full-template initializer test")
 
 
+def _bash_with_supported_python() -> str:
+    bash = _bash()
+    try:
+        probe = subprocess.run(
+            [
+                bash,
+                "-lc",
+                "for candidate in python3 python python3.13 python3.12 python3.11; do "
+                "command -v \"$candidate\" >/dev/null 2>&1 && "
+                "\"$candidate\" scripts/check_python_version.py --quiet && exit 0; "
+                "done; exit 1",
+            ],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.skip("Bash Python probe timed out")
+    if probe.returncode != 0:
+        pytest.skip("Bash requires its own Python >=3.11,<3.14 interpreter")
+    return bash
+
+
 def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
     target = tmp_path / "template"
     shutil.copytree(
@@ -63,7 +89,7 @@ def test_full_repository_copy_initializes_consistently(tmp_path: Path) -> None:
     )
     assert inventory.returncode == 0, inventory.stderr
     arguments = [
-        _bash(),
+        _bash_with_supported_python(),
         "scripts/init_project.sh",
         "--name",
         "Atlas Service",
