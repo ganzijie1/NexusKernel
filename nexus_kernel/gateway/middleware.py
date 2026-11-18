@@ -178,6 +178,7 @@ class RequestTimeoutMiddleware:
             await self.app(scope, receive, send)
             return
 
+        started = time.perf_counter()
         buffered = _BufferedHttpResponse(self._max_response_buffer_bytes)
 
         async def run_application() -> None:
@@ -194,6 +195,14 @@ class RequestTimeoutMiddleware:
                     _raise_response_task_error(app_task)
         except TimeoutError:
             _abandon_response(app_task, buffered)
+            route = scope.get("route")
+            declared_path = getattr(route, "path", scope.get("path", "__unmatched__"))
+            self._metrics.record_http(
+                scope.get("method", "UNKNOWN"),
+                declared_path,
+                504,
+                time.perf_counter() - started,
+            )
             await self._send_error(scope, receive, send, "request_timeout", 504)
             return
         except _ResponseTooLarge:

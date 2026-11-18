@@ -1044,6 +1044,7 @@ class AppAgentRunsService:
         task: asyncio.Task[WorkflowInvocationResult] | None = None
         expires_mono = 0.0
         phase_timeout = 0.0
+        deadline_limited = False
         phase_started_mono = 0.0
         async with self._lock:
             record = self._runs.get(phase.run_id)
@@ -1059,6 +1060,7 @@ class AppAgentRunsService:
             else:
                 tools = self._tools_for(record.application)
                 phase_timeout = min(self._config.phase_timeout_seconds, remaining)
+                deadline_limited = remaining <= self._config.phase_timeout_seconds
                 phase_started_mono = time.monotonic()
                 record.session_touched = True
                 self._transition(record, AgentRunStatus.RUNNING)
@@ -1079,7 +1081,10 @@ class AppAgentRunsService:
         if task is None:
             return
         execution = await self._wait_for_phase_execution(
-            task, timeout_seconds=phase_timeout, expires_mono=expires_mono
+            task,
+            timeout_seconds=phase_timeout,
+            expires_mono=expires_mono,
+            deadline_limited=deadline_limited,
         )
         if execution.timed_out:
             phase_outcome = await self._mark_phase_timeout(phase.run_id, execution)
@@ -1115,12 +1120,17 @@ class AppAgentRunsService:
         *,
         timeout_seconds: float,
         expires_mono: float,
+        deadline_limited: bool,
     ) -> _PhaseExecution:
         try:
             done, _ = await asyncio.wait((task,), timeout=timeout_seconds)
             if not done:
                 task.cancel()
-                error_code, terminal = self._phase_timeout_failure(expires_mono)
+                error_code, terminal = (
+                    ("agent_run_expired", AgentRunStatus.EXPIRED)
+                    if deadline_limited
+                    else self._phase_timeout_failure(expires_mono)
+                )
                 return _PhaseExecution(
                     error_code=error_code,
                     error_terminal=terminal,

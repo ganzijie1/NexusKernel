@@ -103,6 +103,14 @@ def _request() -> ChatRequest:
     )
 
 
+async def _wait_for_deletes(backend: FakeAdkBackend, count: int) -> None:
+    for _ in range(100):
+        if len(backend.deleted) >= count:
+            return
+        await asyncio.to_thread(time.sleep, 0.005)
+    raise AssertionError(f"expected {count} deleted sessions")
+
+
 @pytest.mark.parametrize(
     "field",
     [
@@ -217,7 +225,7 @@ async def test_adk_workflow_uses_phase_timeout_and_model_scoped_definition() -> 
     first = GoogleAdkRuntime(
         api_key="secret",  # security-test-fixture
         model="model-a",
-        timeout_seconds=0.01,
+        timeout_seconds=0.05,
         session_cleanup_timeout_seconds=0.005,
         backend=first_backend,  # security-test-fixture
     )
@@ -225,7 +233,7 @@ async def test_adk_workflow_uses_phase_timeout_and_model_scoped_definition() -> 
     second = GoogleAdkRuntime(
         api_key="secret",  # security-test-fixture
         model="model-b",
-        timeout_seconds=0.01,
+        timeout_seconds=0.05,
         session_cleanup_timeout_seconds=0.005,
         backend=second_backend,  # security-test-fixture
     )
@@ -446,13 +454,13 @@ async def test_adk_timeout_and_backend_errors_discard_session_without_details() 
     runtime = GoogleAdkRuntime(
         api_key="secret",  # security-test-fixture
         model="gemini-test",
-        timeout_seconds=0.01,
-        session_cleanup_timeout_seconds=0.01,
+        timeout_seconds=0.05,
+        session_cleanup_timeout_seconds=0.05,
         backend=slow_backend,
     )
     with pytest.raises(AiTimeoutError):
         await runtime.run(request, identity=AgentIdentity("user"), session_id="session")
-    await asyncio.sleep(0)
+    await _wait_for_deletes(slow_backend, 2)
     assert await runtime.health_check() is False
     assert slow_backend.deleted == [
         SessionKey("user", "session"),
@@ -467,7 +475,7 @@ async def test_adk_timeout_and_backend_errors_discard_session_without_details() 
     )
     with pytest.raises(AiProviderError) as captured:
         await broken.run(request, identity=AgentIdentity("user"), session_id="session")
-    await asyncio.sleep(0)
+    await _wait_for_deletes(backend, 2)
     assert captured.value.__cause__ is None
     assert "must-not-leak" not in str(captured.value)
     assert "private prompt" not in str(captured.value)
@@ -1146,7 +1154,7 @@ async def test_close_sends_second_cancel_to_noncooperative_cleanup() -> None:
         api_key="secret",  # security-test-fixture
         model="model",
         timeout_seconds=1,
-        session_cleanup_timeout_seconds=0.01,
+        session_cleanup_timeout_seconds=0.05,
         backend=backend,  # security-test-fixture
         session_store=store,
     )
@@ -1646,7 +1654,7 @@ async def test_adk_request_deadline_includes_lazy_start(
     runtime = GoogleAdkRuntime(
         api_key="secret",  # security-test-fixture
         model="model",
-        timeout_seconds=0.01,
+        timeout_seconds=0.05,
         session_cleanup_timeout_seconds=0.005,
     )
     request = ChatRequest(messages=[ChatMessage(role="user", content="hello")])

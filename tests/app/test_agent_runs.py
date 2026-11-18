@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -292,15 +293,19 @@ async def _terminal(service: AppAgentRunsService, run_id: str) -> Any:
             AgentRunStatus.REQUIRES_ACTION,
         }:
             return snapshot
-        await asyncio.sleep(0.005)
+        await _poll_delay()
     raise AssertionError("run did not reach an observable state")
+
+
+async def _poll_delay() -> None:
+    await asyncio.to_thread(time.sleep, 0.005)
 
 
 async def _wait_until_deleted(runtime: FakeWorkflowRuntime, session_id: str) -> None:
     for _ in range(100):
         if session_id in runtime.deleted:
             return
-        await asyncio.sleep(0.005)
+        await _poll_delay()
     raise AssertionError("session was not deleted")
 
 
@@ -586,7 +591,7 @@ async def test_capacity_and_cancel_wait_for_runtime_and_cleanup_convergence() ->
             running = await service.get_run(created.run_id, _request())
             if running.status is AgentRunStatus.RUNNING:
                 break
-            await asyncio.sleep(0.005)
+            await _poll_delay()
         router = create_agent_runs_router(service)
         get_endpoint = _route_endpoint(router, "/api/v1/agent-runs/{run_id}", "GET")
         cancel_endpoint = _route_endpoint(
@@ -664,7 +669,7 @@ async def test_idle_sessions_use_ttl_and_lru_without_evicting_busy_sessions() ->
                 await service.get_run(first.run_id, _request())
             except AgentRunNotFoundError:
                 break
-            await asyncio.sleep(0.005)
+            await _poll_delay()
         else:
             raise AssertionError("terminal run was not pruned")
 
@@ -905,7 +910,7 @@ async def test_queued_resume_cancel_cleans_touched_session() -> None:
             running = await service.get_run(blocker.run_id, _request())
             if running.status is AgentRunStatus.RUNNING:
                 break
-            await asyncio.sleep(0.005)
+            await _poll_delay()
         else:
             raise AssertionError("blocker did not start")
 
@@ -2114,7 +2119,7 @@ async def test_close_drains_then_forces_cancel_and_remains_observable() -> None:
                 await service.get_run(created.run_id, _request())
             ).status is AgentRunStatus.RUNNING:
                 break
-            await asyncio.sleep(0.005)
+            await _poll_delay()
         else:
             raise AssertionError("run did not start")
 
@@ -2171,7 +2176,7 @@ async def test_observer_receives_only_low_cardinality_runtime_events() -> None:
                 await service.get_run(created.run_id, _request())
             ).status is AgentRunStatus.RUNNING:
                 break
-            await asyncio.sleep(0.005)
+            await _poll_delay()
         else:
             raise AssertionError("observed run did not start")
 
